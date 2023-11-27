@@ -1320,7 +1320,7 @@ class DistributedGPTModel(torch.nn.Module):
 
         resp_sentences, resp_sentences_seg = self._generate(inputs, max_gen_len)
 
-        print(resp_sentences)
+        print(resp_sentences, resp_sentences_seg)
 
     def _run_core(self, rank, is_master=False):
         world_size = self.num_wrks
