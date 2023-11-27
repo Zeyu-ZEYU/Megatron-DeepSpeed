@@ -1463,8 +1463,6 @@ class DistributedGPTModel(torch.nn.Module):
                 all_outputs.append(model_conn.recv())
             output = torch.cat(all_outputs, 1)
 
-            print(output.shape)
-
             assert output is not None
             output = output.float()
             logits = output[:, -1].view(batch_size, -1).contiguous()
