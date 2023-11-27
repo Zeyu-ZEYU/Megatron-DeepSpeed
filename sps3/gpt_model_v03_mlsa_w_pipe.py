@@ -1,18 +1,21 @@
 #! /usr/bin/env python3
 
 
+import argparse
 import math
 import pickle
+import subprocess
+import threading
 from contextlib import nullcontext
 from typing import Any, List, Optional
 
 import einops
 import torch
 import torch.distributed as dist
-import torch.multiprocessing as mp
 import torch.nn.functional as F
 from apex.normalization.fused_layer_norm import MixedFusedLayerNorm
 from torch.nn.parameter import Parameter
+from zutils import net as znet
 
 from megatron import core
 from megatron.core.utils import divide
@@ -21,6 +24,22 @@ from megatron.core.utils import divide
 from megatron.model.enums import AttnMaskType
 from megatron.model.fused_bias_gelu import bias_gelu_impl
 from megatron.model.fused_softmax import FusedScaleMaskSoftmax
+
+IPS = ["127.0.0.1"]
+GPUS = [[0, 1]]
+MASTER_DIST_PORT = 43214
+MASTER_SERVER_PORT = 43211
+NODE_SERVER_PORT = 34119
+CODE_NAME_FOR_SHELL = "gpt_model_v03_mlsa_w_pipe.py"
+CODE_PATH_FOR_SHELL = "/u/qxc4fh/zeyu_workspace/Megatron-DeepSpeed/sps3"
+
+
+# Inference config
+CONFIG = {}
+CONFIG["param_path"] = "/u/qxc4fh/zeyu_workspace/gpt_params.pkl"
+CONFIG["tokenizer_path"] = "/u/qxc4fh/zeyu_workspace/gpt_tokenizer_kernel.pkl"
+CONFIG["precision"] = 16
+
 
 # These hyper-parameters are noly for GPTModel rather than DistributedGPTModel
 IS_TRAINING = False
@@ -1261,45 +1280,101 @@ class GPTTokenizer:
 
 
 class DistributedGPTModel(torch.nn.Module):
-    def __init__(self, config, *args, **kwargs) -> None:
+    def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
+        num_wrks = 0
+        for node in GPUS:
+            for _ in node:
+                num_wrks += 1
+        self.num_wrks = num_wrks
+        self.encoder_seq_length = self.num_wrks * CONTEXT_LEN
 
-        self.master_ip = config["master_ip"]
-        self.master_port = config["master_port"]
-        self.num_wrk = config["num_wrk"]
-
-        self.gpt_param_path = config["param_path"]
-        self.gpt_tokenizer_kernel_path = config["tokenizer_path"]
-
-        self.precision = config["precision"]
-        self.devices = config["devices"]
-
-        self.encoder_seq_length = self.num_wrk * CONTEXT_LEN
+        self.model_remote_conns = {}
+        self.model_local_conn = None
 
     def run(self, inputs, max_gen_len):
-        self._wrk_comm_queues: List = []
-        processes = []
-        mp.set_start_method("spawn")
-        for idx in range(self.num_wrk):
-            info = {}
-            info["rank"] = idx
-            info["device"] = self.devices[idx]
-            input_q = mp.Queue()
-            output_q = mp.Queue()
-            self._wrk_comm_queues.append([input_q, output_q])
-            process = mp.Process(target=self._run_worker, args=(info, [input_q, output_q]))
-            processes.append(process)
-            process.start()
+        master_server_listener = znet.SocketMsger.tcp_listener("0.0.0.0", MASTER_SERVER_PORT)
+
+        def run_listener_thread(listener, model_conns, num_wrks):
+            while True:
+                conn, _ = listener.accept()
+                rank = conn.recv()
+                model_conns[rank] = conn
+                if len(model_conns) == num_wrks:
+                    break
+
+        list_thread = threading.Thread(
+            target=run_listener_thread, args=(master_server_listener, self.model_remote_conns, self.num_wrks)
+        )
+        list_thread.start()
+        threading.Thread(
+            target=self._run_core,
+            args=(
+                0,
+                True,
+            ),
+        ).start()
+        list_thread.join()
+        for i in range(self.num_wrks):
+            self.model_remote_conns[i].send("START")
 
         resp_sentences, resp_sentences_seg = self._generate(inputs, max_gen_len)
 
-        for process in processes:
-            process.join()
+        print(resp_sentences)
 
-        print(resp_sentences, resp_sentences_seg)
+    def _run_core(self, rank, is_master=False):
+        world_size = self.num_wrks
+
+        if is_master:
+            assert rank == 0
+            listener_ip = "127.0.0.1"
+        else:
+            listener_ip = IPS[0]
+
+        gpus_idx = 0
+        gpu_id = None
+        for node in GPUS:
+            for gid in node:
+                if gpus_idx == rank:
+                    gpu_id = gid
+                    break
+                gpus_idx += 1
+            if gpu_id is not None:
+                break
+        assert gpu_id is not None
+
+        self.model_local_conn = znet.SocketMsger.tcp_connect(listener_ip, MASTER_SERVER_PORT)
+        self.model_local_conn.send(rank)
+        model = GPTModel(CONFIG["param_path"], CONFIG["precision"], f"cuda:{gpu_id}")
+        model.eval()
+        # get START cmd
+        self.model_local_conn.recv()
+        dist.init_process_group("nccl", init_method=f"tcp://{IPS[0]}:{MASTER_DIST_PORT}", rank=rank, world_size=world_size)
+
+        for gsize in MUL_LEV_SPA_ATN_GRP_SIZES:
+            start = 0
+            end = gsize
+            for i in range(0, world_size, gsize):
+                start = i
+                end = i + gsize
+                if end > world_size:
+                    end = world_size
+                group_ids = [r for r in range(start, end)]
+                group = dist.new_group(group_ids)
+                if rank in group_ids:
+                    _MUL_LEV_SPA_ATN_GRPS.append(group)
+
+        while True:
+            batch = self.model_local_conn.recv()
+            if isinstance(batch, str) and batch == "EXIT":
+                self.model_local_conn.close()
+                return
+            with torch.no_grad():
+                output = model(batch)
+            self.model_local_conn.send(output.cpu())
 
     def _generate(self, inputs, max_gen_len):
-        tokenizer = GPTTokenizer(self.gpt_tokenizer_kernel_path)
+        tokenizer = GPTTokenizer(CONFIG["tokenizer_path"])
 
         context_tokens_tensor, context_length_tensor = self._tokenize_batch(tokenizer, inputs, max_gen_len)
         context_length = context_length_tensor.min().item()
@@ -1337,7 +1412,7 @@ class DistributedGPTModel(torch.nn.Module):
                 positions2use_list = None
                 split_indices = []
                 remaining_len = context_length
-                for i in range(self.num_wrk):
+                for i in range(self.num_wrks):
                     if remaining_len >= CONTEXT_LEN:
                         remaining_len -= CONTEXT_LEN
                         split_indices.append((i + 1) * CONTEXT_LEN)
@@ -1346,16 +1421,16 @@ class DistributedGPTModel(torch.nn.Module):
                         break
                 tokens2use_list = [t.contiguous() for t in torch.tensor_split(tokens2use, split_indices, 1)]
                 positions2use_list = [t.contiguous() for t in torch.tensor_split(positions2use, split_indices, 1)]
-                if len(tokens2use_list) < self.num_wrk:
-                    for _ in range(self.num_wrk - len(tokens2use_list)):
+                if len(tokens2use_list) < self.num_wrks:
+                    for _ in range(self.num_wrks - len(tokens2use_list)):
                         tokens2use_list.append(torch.empty([batch_size, 0], dtype=tokens2use.dtype))
                         positions2use_list.append(torch.empty([batch_size, 0], dtype=positions2use.dtype))
                 # Adjust attention mask.
                 attn_mask = attention_mask_repeat[..., 0:context_length, :context_length]
             else:
                 wrk_id = int(context_length / CONTEXT_LEN)
-                tokens2use_list = [torch.empty([batch_size, 0], dtype=tokens2use.dtype) for _ in range(self.num_wrk)]
-                positions2use_list = [torch.empty([batch_size, 0], dtype=positions2use.dtype) for _ in range(self.num_wrk)]
+                tokens2use_list = [torch.empty([batch_size, 0], dtype=tokens2use.dtype) for _ in range(self.num_wrks)]
+                positions2use_list = [torch.empty([batch_size, 0], dtype=positions2use.dtype) for _ in range(self.num_wrks)]
                 tokens2use_list[wrk_id] = tokens2use
                 positions2use_list[wrk_id] = positions2use
                 # Adjust attention mask.
@@ -1364,7 +1439,7 @@ class DistributedGPTModel(torch.nn.Module):
             set_key_value_array = torch.tensor([set_inference_key_value_memory] * batch_size)
             max_infer_len_array_list = []
             remaining_len = whole_len - 1
-            for _ in range(self.num_wrk):
+            for _ in range(self.num_wrks):
                 if remaining_len >= CONTEXT_LEN:
                     remaining_len -= CONTEXT_LEN
                     max_infer_len_array_list.append(torch.tensor([CONTEXT_LEN] * batch_size))
@@ -1374,19 +1449,21 @@ class DistributedGPTModel(torch.nn.Module):
                 else:
                     max_infer_len_array_list.append(torch.tensor([0] * batch_size))
 
-            for i in range(self.num_wrk):
+            for i in range(self.num_wrks):
                 tokens2use = tokens2use_list[i]
                 positions2use = positions2use_list[i]
                 max_infer_len_array = max_infer_len_array_list[i]
                 batch = [tokens2use, attn_mask, positions2use, set_key_value_array, max_infer_len_array]
-                wrk_input_q = self._wrk_comm_queues[i][0]
-                wrk_input_q.put(batch)
+                model_conn = self.model_remote_conns[i]
+                model_conn.send(batch)
 
             all_outputs = []
-            for i in range(self.num_wrk):
-                wrk_output_q = self._wrk_comm_queues[i][1]
-                all_outputs.append(wrk_output_q.get())
+            for i in range(self.num_wrks):
+                model_conn = self.model_remote_conns[i]
+                all_outputs.append(model_conn.recv())
             output = torch.cat(all_outputs, 1)
+
+            print(output.shape)
 
             assert output is not None
             output = output.float()
@@ -1443,8 +1520,9 @@ class DistributedGPTModel(torch.nn.Module):
         resp_sentences = []
         resp_sentences_seg = []
 
-        for i in range(self.num_wrk):
-            self._wrk_comm_queues[i][0].put("EXIT")
+        for i in range(self.num_wrks):
+            self.model_remote_conns[i].send("EXIT")
+            self.model_remote_conns[i].close()
 
         decode_tokens = tokens[:, :context_length]
         decode_tokens = decode_tokens.numpy().tolist()
@@ -1463,40 +1541,6 @@ class DistributedGPTModel(torch.nn.Module):
             resp_sentences_seg.append(words)
 
         return resp_sentences, resp_sentences_seg
-
-    def _run_worker(self, info, comm_queues: List[mp.Queue]):
-        rank = info["rank"]
-        device = info["device"]
-
-        model = GPTModel(self.gpt_param_path, self.precision, device)
-        model.eval()
-
-        dist.init_process_group(
-            "nccl", init_method=f"tcp://{self.master_ip}:{self.master_port}", rank=rank, world_size=self.num_wrk
-        )
-        dist.barrier()
-
-        world_size = dist.get_world_size()
-        for gsize in MUL_LEV_SPA_ATN_GRP_SIZES:
-            start = 0
-            end = gsize
-            for i in range(0, world_size, gsize):
-                start = i
-                end = i + gsize
-                if end > world_size:
-                    end = world_size
-                group_ids = [r for r in range(start, end)]
-                group = dist.new_group(group_ids)
-                if rank in group_ids:
-                    _MUL_LEV_SPA_ATN_GRPS.append(group)
-
-        while True:
-            batch = comm_queues[0].get()
-            if isinstance(batch, str) and batch == "EXIT":
-                return
-            with torch.no_grad():
-                output = model(batch)
-            comm_queues[1].put(output.cpu())
 
     def _pad_batch(self, batch, pad_id, max_len):
         context_lengths = []
@@ -1596,18 +1640,40 @@ class DistributedGPTModel(torch.nn.Module):
 
 
 if __name__ == "__main__":
-    config = {}
-    config["master_ip"] = "127.0.0.1"
-    config["master_port"] = 34565
-    config["param_path"] = "/u/qxc4fh/zeyu_workspace/gpt_params.pkl"
-    config["tokenizer_path"] = "/u/qxc4fh/zeyu_workspace/gpt_tokenizer_kernel.pkl"
-    config["precision"] = 16
-    config["devices"] = ["cuda:0", "cuda:1"]
-    config["num_wrk"] = len(config["devices"])
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-s", "--server", action="store_true")
+    parser.add_argument("-w", "--worker", action="store_true")
+    parser.add_argument("-r", "--rank", default=0, type=int)
+    args = parser.parse_args()
 
-    string = "run "
-    for _ in range(22):
-        string += "run "
-    string = string.strip()
+    if args.server:
+        listener = znet.SocketMsger.tcp_listener("0.0.0.0", NODE_SERVER_PORT)
 
-    DistributedGPTModel(config).run(["How big is the universe?"], 22)
+        while True:
+            req_conn, _ = listener.accept()
+            cmds = req_conn.recv()
+            for cmd in cmds:
+                subprocess.call(cmd, shell=True)
+            req_conn.close()
+    else:
+        if args.worker:
+            assert args.rank > 0
+            dist_gpt_model = DistributedGPTModel()
+            dist_gpt_model._run_core(args.rank)
+        else:
+            remote_rank = 0
+            for node_idx in range(len(IPS)):
+                ip = IPS[node_idx]
+                node_gpus = GPUS[node_idx]
+                conn = znet.SocketMsger.tcp_connect(ip, NODE_SERVER_PORT)
+                cmds = []
+                for _ in node_gpus:
+                    if remote_rank == 0:
+                        remote_rank += 1
+                        continue
+                    cmds.append(f"python3 {CODE_PATH_FOR_SHELL}/{CODE_NAME_FOR_SHELL} -w -r {remote_rank}")
+                    remote_rank += 1
+                conn.send(cmds)
+                conn.close()
+            dist_gpt_model = DistributedGPTModel()
+            dist_gpt_model.run(["How big is the universe?"], 50)
