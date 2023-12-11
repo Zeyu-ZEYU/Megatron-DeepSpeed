@@ -4,6 +4,7 @@ dir=`pwd`
 ### Main configs
 ## GPT-3 models use 2K sequence length/context window
 seq_len=32768
+seq_len=2048
 
 ## The "GPT-3 XXX" below are configs from GPT-3 paper
 ## https://arxiv.org/abs/2005.14165, choose based on
@@ -16,15 +17,15 @@ seq_len=32768
 ## We changed min_lr to a lower number (1.0e-6), which we found is able to
 ## provide better zero-shot eval results.
 
-## GPT-3 Small 125M
-# model_size=0.125
-# num_layers=12
-# hidden_size=768
-# num_attn_heads=12
-# global_batch_size=256
-# lr=6.0e-4
-# min_lr=1.0e-6
-# init_std=0.02
+# GPT-3 Small 125M
+model_size=0.125
+num_layers=12
+hidden_size=768
+num_attn_heads=12
+global_batch_size=256
+lr=6.0e-4
+min_lr=1.0e-6
+init_std=0.02
 
 ## GPT-3 Medium 350M
 # model_size=0.35
@@ -46,15 +47,15 @@ seq_len=32768
 # min_lr=1.0e-6
 # init_std=0.015
 
-## GPT-3 XL 1.3B
-model_size=1.3
-num_layers=24
-hidden_size=2048
-num_attn_heads=16
-global_batch_size=2
-lr=2.0e-4
-min_lr=1.0e-6
-init_std=0.013
+# ## GPT-3 XL 1.3B
+# model_size=1.3
+# num_layers=24
+# hidden_size=2048
+# num_attn_heads=16
+# global_batch_size=2
+# lr=2.0e-4
+# min_lr=1.0e-6
+# init_std=0.013
 
 ## GPT-3 2.7B
 # model_size=2.7
@@ -101,7 +102,7 @@ init_std=0.013
 train_tokens_in_billion=300
 train_tokens=$((${train_tokens_in_billion} * 1000000000))
 
-## train_samples is another termination condition and also affect the number of 
+## train_samples is another termination condition and also affect the number of
 ## data samples to be indexed. Since we want to reach the train_tokens
 ## above, and data efficiency techniques may change num tokens in some samples,
 ## so we just set this config large enough to make sure we have enough
@@ -124,7 +125,7 @@ lr_warmup_tokens=$((${lr_warmup_tokens_in_million} * 1000000))
 ## Here we changed the LR decay tokens to align with total train tokens, since
 ## related works (e.g., https://arxiv.org/abs/2203.15556) find that setting the
 ## learning rate schedule to match the number of training tokens results in the
-## best final model quality 
+## best final model quality
 lr_decay_tokens_in_billion=${train_tokens_in_billion}
 lr_decay_tokens=$((${lr_decay_tokens_in_billion} * 1000000000))
 lr_decay_style="cosine"
@@ -277,12 +278,12 @@ megatron_options=" \
     --load ${checkpoint_path} \
     --save ${checkpoint_path} \
     --no-async-tensor-model-parallel-allreduce \
-    --use-flash-attn-triton \
     --tensorboard-queue-size 1 \
     --log-timers-to-tensorboard \
     --log-batch-size-to-tensorboard \
     --log-validation-ppl-to-tensorboard \
     --tensorboard-dir ${tensorboard_path}"
+    # --use-flash-attn-triton \
 
 if [ "${activation_checkpoint}" = "true" ]; then
 megatron_options="${megatron_options} \
