@@ -10,6 +10,7 @@ from contextlib import nullcontext
 from typing import Any, List, Optional
 
 import einops
+import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
@@ -26,11 +27,11 @@ from megatron.model.fused_bias_gelu import bias_gelu_impl
 from megatron.model.fused_softmax import FusedScaleMaskSoftmax
 
 IPS = ["127.0.0.1"]
-GPUS = [[0, 1]]
+GPUS = [[1, 3]]
 MASTER_DIST_PORT = 43214
 MASTER_SERVER_PORT = 43211
 NODE_SERVER_PORT = 34119
-CODE_NAME_FOR_SHELL = "gpt_model_v03_mlsa_w_pipe.py"
+CODE_NAME_FOR_SHELL = "gpt_model_v04_mlsa_w_pipe.py"
 CODE_PATH_FOR_SHELL = "/u/qxc4fh/zeyu_workspace/Megatron-DeepSpeed/sps3"
 
 
@@ -54,9 +55,17 @@ assert HIDDEN_SIZE % NUM_HEADS == 0
 
 # Other global variables
 MUL_LEV_SPA_ATN_GRP_SIZES = [1, 2]
-MUL_LEV_SPA_ATN_SPARSE_DEGREES = [1, 4]
+MUL_LEV_SPA_ATN_SPARSE_DEGREES = [1, 2]
+MUL_LEV_SPA_ATN_MICRO_BATCH_HEAD_SIZES = [None, 4]
+MUL_LEV_SPA_ATN_MICRO_BATCH_Q_TOKEN_SIZES = [None, 100]
+# MUL_LEV_SPA_ATN_MICRO_BATCH_KV_TOKEN_SIZES = [None, 100]
 assert len(MUL_LEV_SPA_ATN_GRP_SIZES) == len(MUL_LEV_SPA_ATN_SPARSE_DEGREES)
 _MUL_LEV_SPA_ATN_GRPS = []
+
+
+def ASSERT(condition, enabled=True):
+    if enabled:
+        assert condition
 
 
 class VocabEmbedding(torch.nn.Module):
@@ -788,6 +797,494 @@ class MLSAForOneLevel(torch.nn.Module):
         return output, denomi
 
 
+class MLSAPipelineCoreAttn(torch.nn.Module):
+    def __init__(self, layer_num, precision, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.layer_num = max(1, layer_num)
+        self.precision = precision
+        self.norm_factor = math.sqrt(HIDDEN_SIZE / NUM_HEADS)
+        coeff = self.layer_num
+        self.norm_factor *= coeff
+        self.scale_mask_softmax = MLSASoftmax(precision == 16, attention_mask_func, coeff)
+        self.attention_dropout = torch.nn.Dropout(0.1)
+
+    def forward(self, query_layer, key_layer, value_layer, attention_mask):
+        # ===================================
+        # Raw attention scores. [b, np, s, s]
+        # ===================================
+
+        # [b, np, sq, sk]
+        output_size = (query_layer.size(1), query_layer.size(2), query_layer.size(0), key_layer.size(0))
+
+        # [sq, b, np, hn] -> [sq, b * np, hn]
+        query_layer = query_layer.view(output_size[2], output_size[0] * output_size[1], -1)
+        # [sk, b, np, hn] -> [sk, b * np, hn]
+        key_layer = key_layer.view(output_size[3], output_size[0] * output_size[1], -1)
+
+        # preallocting input tensor: [b * np, sq, sk]
+        # TODO: improve the performance
+        # matmul_input_buffer = torch.empty(
+        #     output_size[0] * output_size[1], output_size[2], output_size[3], dtype=query_layer.dtype
+        # )
+        matmul_input_buffer = torch.empty(1, device=query_layer.device)
+
+        # Raw attention scores. [b * np, sq, sk]
+        matmul_result = torch.baddbmm(
+            matmul_input_buffer,
+            query_layer.transpose(0, 1),  # [b * np, sq, hn]
+            key_layer.transpose(0, 1).transpose(1, 2),  # [b * np, hn, sk]
+            beta=0.0,
+            alpha=(1.0 / self.norm_factor),
+        )
+
+        # change view to [b, np, sq, sk]
+        attention_scores = matmul_result.view(*output_size)
+
+        # attention scores and attention mask [b, np, sq, sk]
+        attention_probs, denomi = self.scale_mask_softmax(attention_scores, attention_mask)
+
+        # This is actually dropping out entire tokens to attend to, which might
+        # seem a bit unusual, but is taken from the original Transformer paper.
+        attention_probs = self.attention_dropout(attention_probs)
+
+        # =========================
+        # Context layer. [sq, b, hp]
+        # =========================
+
+        # value_layer -> context layer.
+        # [sk, b, np, hn] --> [b, np, sq, hn]
+
+        # context layer shape: [b, np, sq, hn]
+        output_size = (value_layer.size(1), value_layer.size(2), query_layer.size(0), value_layer.size(3))
+
+        # change view [sk, b * np, hn]
+        value_layer = value_layer.view(value_layer.size(0), output_size[0] * output_size[1], -1)
+
+        # change view [b * np, sq, sk]
+        attention_probs = attention_probs.view(output_size[0] * output_size[1], output_size[2], -1)
+
+        # matmul: [b * np, sq, hn]
+        context_layer = torch.bmm(attention_probs, value_layer.transpose(0, 1))
+
+        # change view [b, np, sq, hn]
+        context_layer = context_layer.view(*output_size)
+
+        # [b, np, sq, hn] --> [sq, b, np, hn]
+        context_layer = context_layer.permute(2, 0, 1, 3).contiguous()
+
+        # [sq, b, np, hn] --> [sq, b, hp]
+        new_context_layer_shape = context_layer.size()[:-2] + (context_layer.size(2) * context_layer.size(3),)
+        context_layer = context_layer.view(*new_context_layer_shape)
+
+        return context_layer, denomi
+
+
+class MLSAPipelineAttn(torch.nn.Module):
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+
+        self.num_lv = len(MUL_LEV_SPA_ATN_GRP_SIZES)
+        self.lv_qkv = []  # [level][q/k/v]
+
+        # self.lv_num_q_tokens = []
+        # self.lv_num_kv_tokens = []
+
+        self.data_to_transf = []  # [lv][q/k/v][node_part][h_micro_part][token_part]
+        self.data_to_receive = []  # [lv][q/k/v][node_part][h_micro_part][token_part]
+        self.masks = []  # [lv][node_part][token_part]
+
+        self.q_inputs = []  # [lv][h_micro_part][token_part]
+        self.q_outputs = []  # [lv][h_micro_part][token_part]
+        self.k_inputs = []  # [lv][h_micro_part]
+        self.k_outputs = []  # [lv][h_micro_part]
+        self.v_inputs = []  # [lv][h_micro_part]
+        self.v_outputs = []  # [lv][h_micro_part]
+
+        for lv in range(self.num_lv):
+            group_size = MUL_LEV_SPA_ATN_GRP_SIZES[lv]
+            self.lv_qkv.append(None)
+            # self.lv_num_q_tokens.append(None)
+            # self.lv_num_kv_tokens.append(None)
+            if group_size == 1:
+                self.data_to_transf.append(None)
+                self.data_to_receive.append(None)
+                self.masks.append(None)
+                self.q_inputs.append(None)  # [lv][h_micro_part][token_part]
+                self.q_outputs.append(None)  # [lv][h_micro_part][token_part]
+                self.k_inputs.append(None)  # [lv][h_micro_part]
+                self.k_outputs.append(None)  # [lv][h_micro_part]
+                self.v_inputs.append(None)  # [lv][h_micro_part]
+                self.v_outputs.append(None)  # [lv][h_micro_part]
+            else:
+                self.data_to_transf.append({"q": [], "k": [], "v": []})
+                self.data_to_receive.append({"q": [], "k": [], "v": []})
+                self.masks.append([])
+                group_size = MUL_LEV_SPA_ATN_GRP_SIZES[lv]
+                hd_step = MUL_LEV_SPA_ATN_MICRO_BATCH_HEAD_SIZES[lv]
+                assert NUM_HEADS % group_size == 0
+                nhead_per_rank = NUM_HEADS // group_size
+                num_head_micro_parts = (
+                    nhead_per_rank // hd_step if nhead_per_rank % hd_step == 0 else nhead_per_rank // hd_step + 1
+                )
+                self.q_inputs.append([None for _ in range(num_head_micro_parts)])  # [lv][h_micro_part][token_part]
+                self.q_outputs.append([None for _ in range(num_head_micro_parts)])  # [lv][h_micro_part][token_part]
+                self.k_inputs.append([[] for _ in range(num_head_micro_parts)])  # [lv][h_micro_part]
+                self.k_outputs.append([[] for _ in range(num_head_micro_parts)])  # [lv][h_micro_part]
+                self.v_inputs.append([[] for _ in range(num_head_micro_parts)])  # [lv][h_micro_part]
+                self.v_outputs.append([[] for _ in range(num_head_micro_parts)])  # [lv][h_micro_part]
+
+    def forward(self, q, k, v, tf_shared_dict, is_prompt=True):
+        # q k v shape (t, b, h, hdim)
+        assert tf_shared_dict is not None
+
+        # CRITICAL
+        q = q.type(k.dtype)
+
+        for lv in range(self.num_lv):
+            self._pre_pipeline_per_level(q, k, v, lv, tf_shared_dict, is_prompt)
+
+        self._pipeline()
+        print("EXIT")
+        exit()
+
+    def _pipeline(self):
+        dtype = self.lv_qkv[0]["q"].dtype
+        device = self.lv_qkv[0]["q"].device
+        # exchange data
+        for lv in range(self.num_lv):
+            group = _MUL_LEV_SPA_ATN_GRPS[lv]
+            group_size = MUL_LEV_SPA_ATN_GRP_SIZES[lv]
+            local_rank = dist.get_rank(group)
+            sparse_degree = MUL_LEV_SPA_ATN_SPARSE_DEGREES[lv]
+            head_step = MUL_LEV_SPA_ATN_MICRO_BATCH_HEAD_SIZES[lv]
+            if group_size == 1:
+                continue
+            else:
+                # get the max number of q partitions
+                all_num_q_parts = []
+                for grank in range(group_size):
+                    if grank == local_rank:
+                        other_rank = (grank + 1) % group_size
+                        the_lst = self.data_to_transf[lv]["q"][other_rank][0]
+                        ASSERT(isinstance(the_lst, (list, tuple)))
+                        the_num = len(the_lst)
+                    else:
+                        the_lst = self.data_to_receive[lv]["q"][grank][0]
+                        ASSERT(isinstance(the_lst, (list, tuple)))
+                        the_num = len(the_lst)
+                    all_num_q_parts.append(the_num)
+                max_num = np.max(all_num_q_parts)
+                nhead_per_rank = NUM_HEADS // group_size
+                num_head_micro_parts = (
+                    nhead_per_rank // head_step if nhead_per_rank % head_step == 0 else nhead_per_rank // head_step + 1
+                )
+                for micro_hd_idx in range(num_head_micro_parts):
+                    ### send k
+                    # prepare input and output
+                    k_inputs = self.k_inputs[lv][micro_hd_idx]
+                    k_outputs = self.k_outputs[lv][micro_hd_idx]
+                    for grank in range(group_size):
+                        if grank == local_rank:
+                            k_inputs.append(torch.tensor([], dtype=dtype, device=device))
+                            k_outputs.append(torch.tensor([], dtype=dtype, device=device))
+                        else:
+                            tsr_lst = self.data_to_transf[lv]["k"][grank][micro_hd_idx]
+                            if len(tsr_lst) == 0:
+                                k_inputs.append(torch.tensor([], dtype=dtype, device=device))
+                            else:
+                                k_inputs.append(tsr_lst[0].contiguous())
+                            tsr_lst = self.data_to_receive[lv]["k"][grank][micro_hd_idx]
+                            if len(tsr_lst) == 0:
+                                k_outputs.append(torch.tensor([], dtype=dtype, device=device))
+                            else:
+                                k_outputs.append(tsr_lst[0].contiguous())
+                    # all2all
+                    dist.all_to_all(k_outputs, k_inputs, group)
+                    ### send all q partitions
+                    q_inputs_lst = [[] for _ in range(max_num)]
+                    q_outputs_lst = [[] for _ in range(max_num)]
+                    self.q_inputs[lv][micro_hd_idx] = q_inputs_lst
+                    self.q_outputs[lv][micro_hd_idx] = q_outputs_lst
+                    for a2a_idx in range(max_num):
+                        q_inputs = q_inputs_lst[a2a_idx]
+                        q_outputs = q_outputs_lst[a2a_idx]
+                        for grank in range(group_size):
+                            if grank == local_rank:
+                                q_inputs.append(torch.tensor([], dtype=dtype, device=device))
+                                q_outputs.append(torch.tensor([], dtype=dtype, device=device))
+                            else:
+                                tsr_lst = self.data_to_transf[lv]["q"][grank][micro_hd_idx]
+                                if len(tsr_lst) <= a2a_idx:
+                                    q_inputs.append(torch.tensor([], dtype=dtype, device=device))
+                                else:
+                                    q_inputs.append(tsr_lst[a2a_idx].contiguous())
+                                tsr_lst = self.data_to_receive[lv]["q"][grank][micro_hd_idx]
+                                if len(tsr_lst) <= a2a_idx:
+                                    q_outputs.append(torch.tensor([], dtype=dtype, device=device))
+                                else:
+                                    q_outputs.append(tsr_lst[a2a_idx].contiguous())
+                        dist.all_to_all(q_outputs, q_inputs, group)
+                    ### send v
+                    # prepare input and output
+                    v_inputs = self.v_inputs[lv][micro_hd_idx]
+                    v_outputs = self.v_outputs[lv][micro_hd_idx]
+                    for grank in range(group_size):
+                        if grank == local_rank:
+                            v_inputs.append(torch.tensor([], dtype=dtype, device=device))
+                            v_outputs.append(torch.tensor([], dtype=dtype, device=device))
+                        else:
+                            tsr_lst = self.data_to_transf[lv]["v"][grank][micro_hd_idx]
+                            if len(tsr_lst) == 0:
+                                v_inputs.append(torch.tensor([], dtype=dtype, device=device))
+                            else:
+                                v_inputs.append(tsr_lst[0].contiguous())
+                            tsr_lst = self.data_to_receive[lv]["v"][grank][micro_hd_idx]
+                            if len(tsr_lst) == 0:
+                                v_outputs.append(torch.tensor([], dtype=dtype, device=device))
+                            else:
+                                v_outputs.append(tsr_lst[0].contiguous())
+                    # all2all
+                    dist.all_to_all(v_outputs, v_inputs, group)
+
+    def _pre_pipeline_per_level(self, q, k, v, level, tf_shared_dict, is_prompt):
+        is_first_layer = False
+
+        batch_size = q.size(1)
+        head_dim = q.size(3)
+        group = _MUL_LEV_SPA_ATN_GRPS[level]
+        group_size = MUL_LEV_SPA_ATN_GRP_SIZES[level]
+        local_rank = dist.get_rank(group)
+        sparse_degree = MUL_LEV_SPA_ATN_SPARSE_DEGREES[level]
+
+        # get all indices of sampled tokens
+        if f"{level}:indices" not in tf_shared_dict:
+            is_first_layer = True
+            # None placeholder when sparse degree is 1.
+            tf_shared_dict[f"{level}:indices"] = None
+            # num_tokens = q.size(0)
+            if sparse_degree > 1:
+                batch_size = q.size(1)
+                num_heads = q.size(2)
+                head_size = q.size(3)
+                indices_for_heads = []
+                for hd in range(num_heads):
+                    start = hd % sparse_degree
+                    indices = [x for x in range(start, k.size(0) // sparse_degree * sparse_degree, sparse_degree)]
+                    indices_for_heads.append(indices)
+                indices_tensor = torch.tensor(indices_for_heads, dtype=torch.long, device=q.device)
+                indices_tensor = einops.rearrange(indices_tensor, "h t -> t h")
+                indices_tensor = einops.repeat(indices_tensor, "t h -> t b h r", b=batch_size, r=head_size)
+                tf_shared_dict[f"{level}:indices"] = indices_for_heads
+                tf_shared_dict[f"{level}:indices_ts"] = indices_tensor
+                # Create recover-indices
+                # The complete indices will be computed during context_layer recovering
+                rc_indices_tensor = torch.empty([k.size(0), NUM_HEADS], dtype=torch.long, device=q.device).fill_(
+                    indices_tensor.size(0)
+                )
+                for i in range(indices_tensor.size(0)):
+                    for h in range(NUM_HEADS):
+                        token_idx = i * sparse_degree + h % sparse_degree
+                        rc_indices_tensor[token_idx][h] = i
+                tf_shared_dict[f"{level}:rc_indices_ts"] = rc_indices_tensor
+        else:
+            if sparse_degree > 1:
+                indices_tensor = tf_shared_dict[f"{level}:indices_ts"]
+                rc_indices_tensor = tf_shared_dict[f"{level}:rc_indices_ts"]
+
+        if sparse_degree > 1:
+            k_ = k.gather(0, indices_tensor)
+            v_ = v.gather(0, indices_tensor)
+            if is_prompt:
+                q_ = q.gather(0, indices_tensor)
+            else:
+                q_ = q
+        else:
+            q_ = q
+            k_ = k
+            v_ = v
+
+        self.lv_qkv[level] = {"q": q_, "k": k_, "v": v_}
+
+        # if group size is 1, do nothing
+        if group_size == 1:
+            return
+
+        num_q_tokens = q_.size(0)
+        num_kv_tokens = k_.size(0)
+        if is_first_layer:
+            all2all_tensor = torch.tensor([num_q_tokens, num_kv_tokens], device=q_.device)
+            all2all_list = [torch.empty_like(all2all_tensor, device=q_.device) for _ in range(group_size)]
+            dist.all_gather(all2all_list, all2all_tensor, group=group)
+            num_q_tokens_list = []
+            num_kv_tokens_list = []
+            tf_shared_dict[f"{level}:num_q_tk"] = num_q_tokens_list
+            tf_shared_dict[f"{level}:num_kv_tk"] = num_kv_tokens_list
+            for a2a_tensor in all2all_list:
+                num_q_tokens_list.append(a2a_tensor[0].item())
+                num_kv_tokens_list.append(a2a_tensor[1].item())
+        else:
+            num_q_tokens_list = tf_shared_dict[f"{level}:num_q_tk"]
+            num_kv_tokens_list = tf_shared_dict[f"{level}:num_kv_tk"]
+        # self.lv_num_q_tokens[level] = num_q_tokens_list
+        # self.lv_num_kv_tokens[level] = num_kv_tokens_list
+
+        # prepare data to transfer
+        # get micro head indices
+        assert NUM_HEADS % group_size == 0
+        num_head_per_node = NUM_HEADS // group_size
+        if is_first_layer:
+            step = MUL_LEV_SPA_ATN_MICRO_BATCH_HEAD_SIZES[level]
+            head_micro_split_indices = []
+            remaining_heads = num_head_per_node
+            index = 0
+            while True:
+                if remaining_heads > step:
+                    remaining_heads -= step
+                    index += step
+                    head_micro_split_indices.append(index)
+                else:
+                    break
+            tf_shared_dict[f"{level}:h_m_spl_idx"] = head_micro_split_indices
+            # get micro token indices for q
+            step = MUL_LEV_SPA_ATN_MICRO_BATCH_Q_TOKEN_SIZES[level]
+            q_token_micro_split_indices = []
+            remaining_tokens = num_q_tokens
+            index = 0
+            while True:
+                if remaining_tokens > step:
+                    remaining_tokens -= step
+                    index += step
+                    q_token_micro_split_indices.append(index)
+                else:
+                    break
+            tf_shared_dict[f"{level}:q_t_m_spl_idx"] = q_token_micro_split_indices
+            # # get micro token indices for kv
+            # step = MUL_LEV_SPA_ATN_MICRO_BATCH_KV_TOKEN_SIZES[level]
+            # kv_token_micro_split_indices = []
+            # remaining_tokens = num_kv_tokens
+            # index = 0
+            # while True:
+            #     if remaining_tokens > step:
+            #         remaining_tokens -= step
+            #         index += step
+            #         kv_token_micro_split_indices.append(index)
+            #     else:
+            #         break
+            # tf_shared_dict[f"{level}:kv_t_m_spl_idx"] = kv_token_micro_split_indices
+        else:
+            head_micro_split_indices = tf_shared_dict[f"{level}:h_m_spl_idx"]
+            q_token_micro_split_indices = tf_shared_dict[f"{level}:q_t_m_spl_idx"]
+            # kv_token_micro_split_indices = tf_shared_dict[f"{level}:kv_t_m_spl_idx"]
+        for qkv_type in ["q", "k", "v"]:
+            qkv_tsr = self.lv_qkv[level][qkv_type]
+            split_tensors = torch.split(qkv_tsr, num_head_per_node, dim=2)
+            ASSERT(len(split_tensors) == group_size)
+            for i, tsr_per_node in enumerate(split_tensors):
+                if i == local_rank:
+                    self.data_to_transf[level][qkv_type].append(tsr_per_node)
+                else:
+                    hmst_lst = []
+                    hms_tsr = torch.tensor_split(tsr_per_node, head_micro_split_indices, dim=2)
+                    ASSERT(len(hms_tsr) > 0)
+                    if qkv_type == "q":
+                        for each in hms_tsr:
+                            if each.size(0) == 0:
+                                hmst_lst.append([])
+                            else:
+                                hmst_lst.append(torch.tensor_split(each, q_token_micro_split_indices, dim=0))
+                    else:
+                        for each in hms_tsr:
+                            if each.size(0) == 0:
+                                hmst_lst.append([])
+                            else:
+                                hmst_lst.append([each])
+                    self.data_to_transf[level][qkv_type].append(hmst_lst)
+
+        # prepare data to receive
+        if is_first_layer:
+            # data_to_recv_one_lv = {"q": [], "k": [], "v": []}  # [q/k/v][node_part][h_micro_part][token_part]
+            q_step = MUL_LEV_SPA_ATN_MICRO_BATCH_Q_TOKEN_SIZES[level]
+            # kv_step = MUL_LEV_SPA_ATN_MICRO_BATCH_KV_TOKEN_SIZES[level]
+            head_step = MUL_LEV_SPA_ATN_MICRO_BATCH_HEAD_SIZES[level]
+            for gr in range(group_size):
+                if gr == local_rank:
+                    self.data_to_receive[level]["q"].append(None)
+                    self.data_to_receive[level]["k"].append(None)
+                    self.data_to_receive[level]["v"].append(None)
+                    continue
+                nqt = num_q_tokens_list[gr]
+                nkvt = num_kv_tokens_list[gr]
+                q_step_lst = [q_step for _ in range(nqt // q_step)]
+                q_step_lst.append(nqt % q_step)
+                if q_step_lst[-1] == 0:
+                    q_step_lst.pop()
+                # kv_step_lst = [kv_step for _ in range(nkvt // kv_step)]
+                # kv_step_lst.append(nkvt % kv_step)
+                # if kv_step_lst[-1] == 0:
+                #     kv_step_lst.pop()
+                nhead = NUM_HEADS // group_size
+                head_step_lst = [head_step for _ in range(nhead // head_step)]
+                head_step_lst.append(nhead % head_step)
+                if head_step_lst[-1] == 0:
+                    head_step_lst.pop()
+                for qkv_type in ["q", "k", "v"]:
+                    h_m_p_lst = []
+                    for h_step in head_step_lst:
+                        t_m_p_lst = []
+                        if qkv_type == "q":
+                            for tk_step in q_step_lst:
+                                t_m_p_lst.append(
+                                    torch.empty([tk_step, batch_size, h_step, head_dim], dtype=q.dtype, device=q.device)
+                                )
+                        else:
+                            if nkvt != 0:
+                                t_m_p_lst.append(
+                                    torch.empty([nkvt, batch_size, h_step, head_dim], dtype=q.dtype, device=q.device)
+                                )
+                        h_m_p_lst.append(t_m_p_lst)
+                    self.data_to_receive[level][qkv_type].append(h_m_p_lst)
+            tf_shared_dict[f"{level}:data_to_recv"] = self.data_to_receive[level]
+        else:
+            self.data_to_receive[level] = tf_shared_dict[f"{level}:data_to_recv"]
+
+        # prepare mask
+        if is_first_layer:
+            nqt_a2a = np.sum(num_q_tokens_list)
+            nkvt_a2a = np.sum(num_kv_tokens_list)
+            attn_mask = torch.tril(torch.ones((1, nkvt_a2a, nkvt_a2a), device=q.device)).view(1, 1, nkvt_a2a, nkvt_a2a)
+            attn_mask = attn_mask < 0.5
+            attn_mask = torch.concat([attn_mask for _ in range(batch_size)])
+            attn_mask = attn_mask[..., nkvt_a2a - nqt_a2a : nkvt_a2a, :nkvt_a2a]
+            q_split_idx_lst = []
+            index = 0
+            for nqt in num_q_tokens_list:
+                index += nqt
+                q_split_idx_lst.append(index)
+            q_split_idx_lst.pop()
+            q_parts = torch.tensor_split(attn_mask, q_split_idx_lst, dim=2)
+            ASSERT(len(q_parts) == group_size)
+            step = MUL_LEV_SPA_ATN_MICRO_BATCH_Q_TOKEN_SIZES[level]
+            for i, tsr in enumerate(q_parts):
+                if i == local_rank:
+                    self.masks[level].append(tsr)
+                    continue
+                nq = num_q_tokens_list[i]
+                split_indices = []
+                remain_ntk = nq
+                index = 0
+                while True:
+                    if remain_ntk > step:
+                        remain_ntk -= step
+                        index += step
+                        split_indices.append(index)
+                    else:
+                        break
+                self.masks[level].append(torch.tensor_split(tsr, split_indices, dim=2))
+            tf_shared_dict[f"{level}:mask"] = self.masks[level]
+        else:
+            self.masks[level] = tf_shared_dict[f"{level}:mask"]
+
+
 class MLSAttention(torch.nn.Module):
     def __init__(self, layer_num, precision, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -797,11 +1294,12 @@ class MLSAttention(torch.nn.Module):
         self.query_key_value = QKVLinear()
         # self.core_attention = CoreAttention(self.layer_num, self.precision)
         # self.dist_attention = DistributedAttention(self.core_attention)
-        self.core_attention = MLSACoreAttention(self.layer_num, self.precision)
-        self.mlsa_attns = []
-        for lev in range(len(MUL_LEV_SPA_ATN_GRP_SIZES)):
-            self.mlsa_attns.append(MLSAForOneLevel(lev, self.core_attention))
-        self.mlsa_attns = torch.nn.ModuleList(self.mlsa_attns)
+        # self.core_attention = MLSACoreAttention(self.layer_num, self.precision)
+        # self.mlsa_attns = []
+        # for lev in range(len(MUL_LEV_SPA_ATN_GRP_SIZES)):
+        #     self.mlsa_attns.append(MLSAForOneLevel(lev, self.core_attention))
+        # self.mlsa_attns = torch.nn.ModuleList(self.mlsa_attns)
+        self.attention = MLSAPipelineAttn()
         self.dense = AttnOutputLinear()
 
         # Inference key-value memory
@@ -883,32 +1381,33 @@ class MLSAttention(torch.nn.Module):
         #     attention_mask,
         #     tf_shared_dict,
         # )
-        context_layers = []
-        denomis = []
-        sum_denomis = None
-        for mlsa in self.mlsa_attns:
-            context_layer, denomi = mlsa(
-                query_layer, key_layer, value_layer, attention_mask, tf_shared_dict, set_inference_key_value_memory
-            )
-            context_layers.append(context_layer)
-            denomis.append(denomi)
-            if sum_denomis is None:
-                sum_denomis = denomi
-            else:
-                sum_denomis += denomi
-            torch.cuda.synchronize()
-        sum_cxt_layers = None
-        for ctx_ly, deno in zip(context_layers, denomis):
-            alpha = torch.div(deno, sum_denomis)
-            alpha = torch.nan_to_num(alpha)
-            scaled_ctx_ly = ctx_ly * alpha
-            if sum_cxt_layers is None:
-                sum_cxt_layers = scaled_ctx_ly
-            else:
-                sum_cxt_layers += scaled_ctx_ly
-        context_layer = sum_cxt_layers.view(
-            sum_cxt_layers.size(0), sum_cxt_layers.size(1), sum_cxt_layers.size(2) * sum_cxt_layers.size(3)
-        )
+        # context_layers = []
+        # denomis = []
+        # sum_denomis = None
+        # for mlsa in self.mlsa_attns:
+        #     context_layer, denomi = mlsa(
+        #         query_layer, key_layer, value_layer, attention_mask, tf_shared_dict, set_inference_key_value_memory
+        #     )
+        #     context_layers.append(context_layer)
+        #     denomis.append(denomi)
+        #     if sum_denomis is None:
+        #         sum_denomis = denomi
+        #     else:
+        #         sum_denomis += denomi
+        #     torch.cuda.synchronize()
+        # sum_cxt_layers = None
+        # for ctx_ly, deno in zip(context_layers, denomis):
+        #     alpha = torch.div(deno, sum_denomis)
+        #     alpha = torch.nan_to_num(alpha)
+        #     scaled_ctx_ly = ctx_ly * alpha
+        #     if sum_cxt_layers is None:
+        #         sum_cxt_layers = scaled_ctx_ly
+        #     else:
+        #         sum_cxt_layers += scaled_ctx_ly
+        # context_layer = sum_cxt_layers.view(
+        #     sum_cxt_layers.size(0), sum_cxt_layers.size(1), sum_cxt_layers.size(2) * sum_cxt_layers.size(3)
+        # )
+        context_layer = self.attention(query_layer, key_layer, value_layer, tf_shared_dict, set_inference_key_value_memory)
 
         output, bias = self.dense(context_layer)
 
@@ -1674,4 +2173,4 @@ if __name__ == "__main__":
                 conn.send(cmds)
                 conn.close()
             dist_gpt_model = DistributedGPTModel()
-            dist_gpt_model.run(["How big is the universe?"], 50)
+            dist_gpt_model.run(["How big is the universe?", "How big is the universe?"], 50)
