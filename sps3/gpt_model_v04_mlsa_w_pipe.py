@@ -763,7 +763,10 @@ class MLSAForOneLevel(torch.nn.Module):
                 split_indices.append(sl)
             else:
                 split_indices.append(split_indices[-1] + sl)
+        ASSERT(denomi.size(0) == split_indices[-1])
+        split_indices.pop()
         input_list = [t.contiguous() for t in torch.tensor_split(denomi, split_indices, 0)]
+        ASSERT(len(input_list) == len(num_input_tokens_list))
         shape = torch.tensor(input_list[0].shape)
         shape[0] = num_input_tokens_list[dist.get_rank(self.group)]
         output_list = [
@@ -797,7 +800,7 @@ class MLSAForOneLevel(torch.nn.Module):
         return output, denomi
 
 
-class MLSAPipelineCoreAttn(torch.nn.Module):
+class MLSASoftmaxQK(torch.nn.Module):
     def __init__(self, layer_num, precision, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self.layer_num = max(1, layer_num)
@@ -808,7 +811,7 @@ class MLSAPipelineCoreAttn(torch.nn.Module):
         self.scale_mask_softmax = MLSASoftmax(precision == 16, attention_mask_func, coeff)
         self.attention_dropout = torch.nn.Dropout(0.1)
 
-    def forward(self, query_layer, key_layer, value_layer, attention_mask):
+    def forward(self, query_layer, key_layer, attention_mask):
         # ===================================
         # Raw attention scores. [b, np, s, s]
         # ===================================
@@ -842,11 +845,20 @@ class MLSAPipelineCoreAttn(torch.nn.Module):
 
         # attention scores and attention mask [b, np, sq, sk]
         attention_probs, denomi = self.scale_mask_softmax(attention_scores, attention_mask)
+        denomi = denomi.type(attention_probs.dtype)
 
         # This is actually dropping out entire tokens to attend to, which might
         # seem a bit unusual, but is taken from the original Transformer paper.
         attention_probs = self.attention_dropout(attention_probs)
 
+        return attention_probs, einops.rearrange(denomi, "b h t x -> t b h x")
+
+
+class MLSAV(torch.nn.Module):
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+
+    def forward(self, attention_probs, value_layer):
         # =========================
         # Context layer. [sq, b, hp]
         # =========================
@@ -855,7 +867,7 @@ class MLSAPipelineCoreAttn(torch.nn.Module):
         # [sk, b, np, hn] --> [b, np, sq, hn]
 
         # context layer shape: [b, np, sq, hn]
-        output_size = (value_layer.size(1), value_layer.size(2), query_layer.size(0), value_layer.size(3))
+        output_size = (value_layer.size(1), value_layer.size(2), attention_probs.size(2), value_layer.size(3))
 
         # change view [sk, b * np, hn]
         value_layer = value_layer.view(value_layer.size(0), output_size[0] * output_size[1], -1)
@@ -873,15 +885,18 @@ class MLSAPipelineCoreAttn(torch.nn.Module):
         context_layer = context_layer.permute(2, 0, 1, 3).contiguous()
 
         # [sq, b, np, hn] --> [sq, b, hp]
-        new_context_layer_shape = context_layer.size()[:-2] + (context_layer.size(2) * context_layer.size(3),)
-        context_layer = context_layer.view(*new_context_layer_shape)
+        # new_context_layer_shape = context_layer.size()[:-2] + (context_layer.size(2) * context_layer.size(3),)
+        # context_layer = context_layer.view(*new_context_layer_shape)
 
-        return context_layer, denomi
+        return context_layer
 
 
 class MLSAPipelineAttn(torch.nn.Module):
-    def __init__(self, *args, **kwargs) -> None:
+    def __init__(self, softmax_qk, attn_v_op, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
+
+        self.softmax_qk = softmax_qk
+        self.attn_v_op = attn_v_op
 
         self.num_lv = len(MUL_LEV_SPA_ATN_GRP_SIZES)
         self.lv_qkv = []  # [level][q/k/v]
@@ -900,6 +915,11 @@ class MLSAPipelineAttn(torch.nn.Module):
         self.v_inputs = []  # [lv][h_micro_part]
         self.v_outputs = []  # [lv][h_micro_part]
 
+        self.ctx_outputs = []  # [lv][h_micro_part][token_part] with denominator
+
+        self.lv_max_num_q_parts = []
+        self.lv_num_head_micro_parts = []
+
         for lv in range(self.num_lv):
             group_size = MUL_LEV_SPA_ATN_GRP_SIZES[lv]
             self.lv_qkv.append(None)
@@ -915,6 +935,7 @@ class MLSAPipelineAttn(torch.nn.Module):
                 self.k_outputs.append(None)  # [lv][h_micro_part]
                 self.v_inputs.append(None)  # [lv][h_micro_part]
                 self.v_outputs.append(None)  # [lv][h_micro_part]
+                self.ctx_outputs.append(None)
             else:
                 self.data_to_transf.append({"q": [], "k": [], "v": []})
                 self.data_to_receive.append({"q": [], "k": [], "v": []})
@@ -932,6 +953,41 @@ class MLSAPipelineAttn(torch.nn.Module):
                 self.k_outputs.append([[] for _ in range(num_head_micro_parts)])  # [lv][h_micro_part]
                 self.v_inputs.append([[] for _ in range(num_head_micro_parts)])  # [lv][h_micro_part]
                 self.v_outputs.append([[] for _ in range(num_head_micro_parts)])  # [lv][h_micro_part]
+                self.ctx_outputs.append([None for _ in range(num_head_micro_parts)])
+            self.lv_max_num_q_parts.append(None)
+            self.lv_num_head_micro_parts.append(None)
+
+    def _reset_data_structures(self):
+        self.data_to_transf = []  # [lv][q/k/v][node_part][h_micro_part][token_part]
+        self.data_to_receive = []  # [lv][q/k/v][node_part][h_micro_part][token_part]
+        self.masks = []  # [lv][node_part][token_part]
+
+        self.k_inputs = []  # [lv][h_micro_part]
+        self.k_outputs = []  # [lv][h_micro_part]
+        self.v_inputs = []  # [lv][h_micro_part]
+        self.v_outputs = []  # [lv][h_micro_part]
+
+        for lv in range(self.num_lv):
+            group_size = MUL_LEV_SPA_ATN_GRP_SIZES[lv]
+            # self.lv_num_q_tokens.append(None)
+            # self.lv_num_kv_tokens.append(None)
+            if group_size == 1:
+                self.data_to_transf.append(None)
+                self.data_to_receive.append(None)
+                self.masks.append(None)
+                self.k_inputs.append(None)  # [lv][h_micro_part]
+                self.k_outputs.append(None)  # [lv][h_micro_part]
+                self.v_inputs.append(None)  # [lv][h_micro_part]
+                self.v_outputs.append(None)  # [lv][h_micro_part]
+            else:
+                self.data_to_transf.append({"q": [], "k": [], "v": []})
+                self.data_to_receive.append({"q": [], "k": [], "v": []})
+                self.masks.append([])
+                num_head_micro_parts = self.lv_num_head_micro_parts[lv]
+                self.k_inputs.append([[] for _ in range(num_head_micro_parts)])  # [lv][h_micro_part]
+                self.k_outputs.append([[] for _ in range(num_head_micro_parts)])  # [lv][h_micro_part]
+                self.v_inputs.append([[] for _ in range(num_head_micro_parts)])  # [lv][h_micro_part]
+                self.v_outputs.append([[] for _ in range(num_head_micro_parts)])  # [lv][h_micro_part]
 
     def forward(self, q, k, v, tf_shared_dict, is_prompt=True):
         # q k v shape (t, b, h, hdim)
@@ -940,45 +996,34 @@ class MLSAPipelineAttn(torch.nn.Module):
         # CRITICAL
         q = q.type(k.dtype)
 
+        # CRITICAL
+        if not is_prompt:
+            # reset data structures for non-prompt (i.e., token generation one at a time)
+            self._reset_data_structures()
+
         for lv in range(self.num_lv):
             self._pre_pipeline_per_level(q, k, v, lv, tf_shared_dict, is_prompt)
 
-        self._pipeline()
-        print("EXIT")
-        exit()
+        ctx_layer = self._pipeline(tf_shared_dict, is_prompt)
 
-    def _pipeline(self):
+        return ctx_layer
+
+    def _pipeline(self, tf_shared_dict, is_prompt):
         dtype = self.lv_qkv[0]["q"].dtype
         device = self.lv_qkv[0]["q"].device
-        # exchange data
+
+        ### exchange data
         for lv in range(self.num_lv):
             group = _MUL_LEV_SPA_ATN_GRPS[lv]
             group_size = MUL_LEV_SPA_ATN_GRP_SIZES[lv]
             local_rank = dist.get_rank(group)
-            sparse_degree = MUL_LEV_SPA_ATN_SPARSE_DEGREES[lv]
-            head_step = MUL_LEV_SPA_ATN_MICRO_BATCH_HEAD_SIZES[lv]
+            # sparse_degree = MUL_LEV_SPA_ATN_SPARSE_DEGREES[lv]
+            # head_step = MUL_LEV_SPA_ATN_MICRO_BATCH_HEAD_SIZES[lv]
             if group_size == 1:
                 continue
             else:
-                # get the max number of q partitions
-                all_num_q_parts = []
-                for grank in range(group_size):
-                    if grank == local_rank:
-                        other_rank = (grank + 1) % group_size
-                        the_lst = self.data_to_transf[lv]["q"][other_rank][0]
-                        ASSERT(isinstance(the_lst, (list, tuple)))
-                        the_num = len(the_lst)
-                    else:
-                        the_lst = self.data_to_receive[lv]["q"][grank][0]
-                        ASSERT(isinstance(the_lst, (list, tuple)))
-                        the_num = len(the_lst)
-                    all_num_q_parts.append(the_num)
-                max_num = np.max(all_num_q_parts)
-                nhead_per_rank = NUM_HEADS // group_size
-                num_head_micro_parts = (
-                    nhead_per_rank // head_step if nhead_per_rank % head_step == 0 else nhead_per_rank // head_step + 1
-                )
-                for micro_hd_idx in range(num_head_micro_parts):
+                max_num = self.lv_max_num_q_parts[lv]
+                for micro_hd_idx in range(self.lv_num_head_micro_parts[lv]):
                     ### send k
                     # prepare input and output
                     k_inputs = self.k_inputs[lv][micro_hd_idx]
@@ -997,15 +1042,15 @@ class MLSAPipelineAttn(torch.nn.Module):
                             if len(tsr_lst) == 0:
                                 k_outputs.append(torch.tensor([], dtype=dtype, device=device))
                             else:
-                                k_outputs.append(tsr_lst[0].contiguous())
+                                k_outputs.append(tsr_lst[0])
                     # all2all
                     dist.all_to_all(k_outputs, k_inputs, group)
-                    ### send all q partitions
+                    ### send 1st q partition
                     q_inputs_lst = [[] for _ in range(max_num)]
                     q_outputs_lst = [[] for _ in range(max_num)]
                     self.q_inputs[lv][micro_hd_idx] = q_inputs_lst
                     self.q_outputs[lv][micro_hd_idx] = q_outputs_lst
-                    for a2a_idx in range(max_num):
+                    for a2a_idx in range(1 if max_num > 0 else 0):
                         q_inputs = q_inputs_lst[a2a_idx]
                         q_outputs = q_outputs_lst[a2a_idx]
                         for grank in range(group_size):
@@ -1022,7 +1067,7 @@ class MLSAPipelineAttn(torch.nn.Module):
                                 if len(tsr_lst) <= a2a_idx:
                                     q_outputs.append(torch.tensor([], dtype=dtype, device=device))
                                 else:
-                                    q_outputs.append(tsr_lst[a2a_idx].contiguous())
+                                    q_outputs.append(tsr_lst[a2a_idx])
                         dist.all_to_all(q_outputs, q_inputs, group)
                     ### send v
                     # prepare input and output
@@ -1042,9 +1087,247 @@ class MLSAPipelineAttn(torch.nn.Module):
                             if len(tsr_lst) == 0:
                                 v_outputs.append(torch.tensor([], dtype=dtype, device=device))
                             else:
-                                v_outputs.append(tsr_lst[0].contiguous())
+                                v_outputs.append(tsr_lst[0])
                     # all2all
                     dist.all_to_all(v_outputs, v_inputs, group)
+                    # send other q partitions
+                    for a2a_idx in range(1, max_num):
+                        q_inputs = q_inputs_lst[a2a_idx]
+                        q_outputs = q_outputs_lst[a2a_idx]
+                        for grank in range(group_size):
+                            if grank == local_rank:
+                                q_inputs.append(torch.tensor([], dtype=dtype, device=device))
+                                q_outputs.append(torch.tensor([], dtype=dtype, device=device))
+                            else:
+                                tsr_lst = self.data_to_transf[lv]["q"][grank][micro_hd_idx]
+                                if len(tsr_lst) <= a2a_idx:
+                                    q_inputs.append(torch.tensor([], dtype=dtype, device=device))
+                                else:
+                                    q_inputs.append(tsr_lst[a2a_idx].contiguous())
+                                tsr_lst = self.data_to_receive[lv]["q"][grank][micro_hd_idx]
+                                if len(tsr_lst) <= a2a_idx:
+                                    q_outputs.append(torch.tensor([], dtype=dtype, device=device))
+                                else:
+                                    q_outputs.append(tsr_lst[a2a_idx])
+                        dist.all_to_all(q_outputs, q_inputs, group)
+
+        ### compute qkv
+        for lv in range(self.num_lv):
+            group = _MUL_LEV_SPA_ATN_GRPS[lv]
+            group_size = MUL_LEV_SPA_ATN_GRP_SIZES[lv]
+            local_rank = dist.get_rank(group)
+            # sparse_degree = MUL_LEV_SPA_ATN_SPARSE_DEGREES[lv]
+            # head_step = MUL_LEV_SPA_ATN_MICRO_BATCH_HEAD_SIZES[lv]
+            if group_size == 1:
+                q_layer = self.lv_qkv[lv]["q"]
+                k_layer = self.lv_qkv[lv]["k"]
+                v_layer = self.lv_qkv[lv]["v"]
+                if q_layer.size(0) > 0:
+                    the_mask = self.masks[lv]
+                    attn_prob, denomi = self.softmax_qk(q_layer, k_layer, the_mask)
+                    ctx_layer = self.attn_v_op(attn_prob, v_layer)
+                    self.q_outputs[lv] = [ctx_layer, denomi]
+            else:
+                max_num = self.lv_max_num_q_parts[lv]
+                for micro_hd_idx in range(self.lv_num_head_micro_parts[lv]):
+                    entire_k = []
+                    for grank in range(group_size):
+                        if grank == local_rank:
+                            entire_k.append(self.data_to_transf[lv]["k"][grank][micro_hd_idx].contiguous())
+                        else:
+                            added_k = self.k_outputs[lv][micro_hd_idx][grank]
+                            if added_k.size(0) > 0:
+                                entire_k.append(added_k)
+                    entire_k = torch.concat(entire_k, dim=0)
+                    # first q partition
+                    for q_part_idx in range(1 if max_num > 0 else 0):
+                        for grank in range(group_size):
+                            if grank == local_rank:
+                                q_layer = self.data_to_transf[lv]["q"][grank][micro_hd_idx].contiguous()
+                            else:
+                                q_layer = self.q_outputs[lv][micro_hd_idx][q_part_idx][grank]
+                            if q_layer.size(0) == 0:
+                                # self.q_outputs[lv][micro_hd_idx][q_part_idx][grank] = None
+                                continue
+                            else:
+                                # multiply by K
+                                the_mask = self.masks[lv][grank][q_part_idx]
+                                sm_qk, denomi = self.softmax_qk(q_layer, entire_k, the_mask)
+                                if grank == local_rank:
+                                    self.q_outputs[lv][micro_hd_idx][0][grank] = [sm_qk, denomi]
+                                else:
+                                    # of course, q_part_idx can only be 0 if the code has entered this loop
+                                    self.q_outputs[lv][micro_hd_idx][q_part_idx][grank] = [sm_qk, denomi]
+                    # get v
+                    entire_v = []
+                    for grank in range(group_size):
+                        if grank == local_rank:
+                            entire_v.append(self.data_to_transf[lv]["v"][grank][micro_hd_idx].contiguous())
+                        else:
+                            added_v = self.v_outputs[lv][micro_hd_idx][grank]
+                            if added_v.size(0) > 0:
+                                entire_v.append(added_v)
+                    entire_v = torch.concat(entire_v, dim=0)
+                    # Multiply by V for first q partition
+                    for q_part_idx in range(1 if max_num > 0 else 0):
+                        for grank in range(group_size):
+                            # result_lst already includes the consideration of local rank, since q_part_idx can only be 0
+                            result_lst = self.q_outputs[lv][micro_hd_idx][q_part_idx][grank]
+                            if isinstance(result_lst, list):
+                                attn_prob, denomi = result_lst
+                                ctx_layer = self.attn_v_op(attn_prob, entire_v)
+                                self.q_outputs[lv][micro_hd_idx][q_part_idx][grank] = torch.concat([ctx_layer, denomi], dim=3)
+                    # handle all other q partitions
+                    for q_part_idx in range(1, max_num):
+                        for grank in range(group_size):
+                            if grank == local_rank:
+                                pass
+                                # self.q_outputs[lv][micro_hd_idx][q_part_idx][grank] = self.q_outputs[lv][micro_hd_idx][0][grank]
+                            else:
+                                q_layer = self.q_outputs[lv][micro_hd_idx][q_part_idx][grank]
+                                if q_layer.size(0) == 0:
+                                    # self.q_outputs[lv][micro_hd_idx][q_part_idx][grank] = None
+                                    continue
+                                else:
+                                    # multiply by KV
+                                    the_mask = self.masks[lv][grank][q_part_idx]
+                                    sm_qk, denomi = self.softmax_qk(q_layer, entire_k, the_mask)
+                                    ctx_layer = self.attn_v_op(sm_qk, entire_v)
+                                    # temp_lst = [ctx_layer, denomi]  # [ctx layer, denominator]
+                                    self.q_outputs[lv][micro_hd_idx][q_part_idx][grank] = torch.concat(
+                                        [ctx_layer, denomi], dim=3
+                                    )
+
+        ### exchange data
+        for lv in range(self.num_lv):
+            group = _MUL_LEV_SPA_ATN_GRPS[lv]
+            group_size = MUL_LEV_SPA_ATN_GRP_SIZES[lv]
+            local_rank = dist.get_rank(group)
+            if group_size == 1:
+                # Could be None for 0 token or [ctx_layer, denomi]
+                self.ctx_outputs[lv] = self.q_outputs[lv]
+            else:
+                max_num = self.lv_max_num_q_parts[lv]
+                for micro_hd_idx in range(self.lv_num_head_micro_parts[lv]):
+                    if max_num > 0:
+                        self.ctx_outputs[lv][micro_hd_idx][0][local_rank] = self.q_outputs[lv][micro_hd_idx][0][local_rank]
+                    for a2a_idx in range(max_num):
+                        ctx_inputs = []
+                        for i, tsr in enumerate(self.q_outputs[lv][micro_hd_idx][a2a_idx]):
+                            if i == local_rank:
+                                ctx_inputs.append(torch.tensor([], dtype=dtype, device=device))
+                            else:
+                                ctx_inputs.append(tsr)
+                        ctx_outputs = self.ctx_outputs[lv][micro_hd_idx][a2a_idx]
+                        dist.all_to_all(ctx_outputs, ctx_inputs, group)
+
+        # recover and combine all ctx layers
+        ctx_layers = []
+        denomis = []
+        for lv in range(self.num_lv):
+            group = _MUL_LEV_SPA_ATN_GRPS[lv]
+            group_size = MUL_LEV_SPA_ATN_GRP_SIZES[lv]
+            local_rank = dist.get_rank(group)
+            sparse_degree = MUL_LEV_SPA_ATN_SPARSE_DEGREES[lv]
+            if group_size == 1:
+                if self.ctx_outputs[lv] is None:
+                    # ctx_layers.append(None)
+                    # denomis.append(None)
+                    pass
+                else:
+                    output, denomi = self.ctx_outputs[lv]
+                    if sparse_degree > 1 and is_prompt:
+                        # recover output tensor with inserting zeros
+                        output_shape = torch.tensor(output.shape)
+                        output_shape[0] = 1
+                        added_tensor = torch.zeros(*output_shape, dtype=output.dtype, device=output.device)
+                        output = torch.cat([output, added_tensor])
+                        rc_indices_tensor = tf_shared_dict[f"{lv}:rc_indices_ts"]
+                        rc_indices_tensor = einops.repeat(
+                            rc_indices_tensor, "t h -> t b h r", b=output.size(1), r=output.size(3)
+                        )
+                        output = output.gather(0, rc_indices_tensor)
+                        # convert denominator for later use
+                        output_shape[3] = 1
+                        added_tensor = torch.zeros(*output_shape, dtype=output.dtype, device=output.device)
+                        denomi = torch.cat([denomi, added_tensor])
+                        rc_indices_tensor = tf_shared_dict[f"{lv}:rc_indices_ts"]
+                        rc_indices_tensor = einops.repeat(rc_indices_tensor, "t h -> t b h r", b=output.size(1), r=1)
+                        denomi = denomi.gather(0, rc_indices_tensor)
+                    ctx_layers.append(output)
+                    denomis.append(denomi)
+            else:
+                if len(self.ctx_outputs[lv][0]) == 0 or self.ctx_outputs[lv][0][0][local_rank].size(0) == 0:
+                    pass
+                else:
+                    recoverd_ctx = [[None for _ in range(self.lv_num_head_micro_parts[lv])] for _ in range(group_size)]
+                    recoverd_denomi = [[None for _ in range(self.lv_num_head_micro_parts[lv])] for _ in range(group_size)]
+                    for micro_hd_idx in range(self.lv_num_head_micro_parts[lv]):
+                        for grank in range(group_size):
+                            if grank == local_rank:
+                                com_tsr = self.ctx_outputs[lv][micro_hd_idx][0][local_rank]
+                            else:
+                                max_num = self.lv_max_num_q_parts[lv]
+                                to_be_concat = []
+                                for q_part_idx in range(max_num):
+                                    com_tsr = self.ctx_outputs[lv][micro_hd_idx][q_part_idx][grank]
+                                    if com_tsr.size(0) > 0:
+                                        to_be_concat.append(com_tsr)
+                                com_tsr = torch.cat(to_be_concat, dim=0)
+                            output = com_tsr[..., :-1]
+                            denomi = com_tsr[..., -1:]
+                            if sparse_degree > 1 and is_prompt:
+                                # recover output tensor with inserting zeros
+                                output_shape = torch.tensor(output.shape)
+                                output_shape[0] = 1
+                                added_tensor = torch.zeros(*output_shape, dtype=output.dtype, device=output.device)
+                                output = torch.cat([output, added_tensor])
+                                rc_indices_tensor = tf_shared_dict[f"{lv}:rc_indices_ts"][grank][micro_hd_idx]
+                                rc_indices_tensor = einops.repeat(
+                                    rc_indices_tensor, "t h -> t b h r", b=output.size(1), r=output.size(3)
+                                )
+                                output = output.gather(0, rc_indices_tensor)
+                                # convert denominator for later use
+                                output_shape[3] = 1
+                                added_tensor = torch.zeros(*output_shape, dtype=output.dtype, device=output.device)
+                                denomi = torch.cat([denomi, added_tensor])
+                                rc_indices_tensor = tf_shared_dict[f"{lv}:rc_indices_ts"][grank][micro_hd_idx]
+                                rc_indices_tensor = einops.repeat(rc_indices_tensor, "t h -> t b h r", b=output.size(1), r=1)
+                                denomi = denomi.gather(0, rc_indices_tensor)
+                            recoverd_ctx[grank][micro_hd_idx] = output
+                            recoverd_denomi[grank][micro_hd_idx] = denomi
+                    ctx_to_cat = []
+                    denomi_to_cat = []
+                    for grank in range(group_size):
+                        for micro_hd_idx in range(self.lv_num_head_micro_parts[lv]):
+                            ctx_to_cat.append(recoverd_ctx[grank][micro_hd_idx])
+                            denomi_to_cat.append(recoverd_denomi[grank][micro_hd_idx])
+                    ctx_layers.append(torch.cat(ctx_to_cat, dim=2))
+                    denomis.append(torch.cat(denomi_to_cat, dim=2))
+        # use ctx_layers and denomis to combine all result
+        ASSERT(len(ctx_layers) == len(denomis))
+        if len(ctx_layers) == 0:
+            the_shape = self.lv_qkv[0]["q"].shape
+            context_layer = torch.zeros([0, *(the_shape[1:])], dtype=dtype, device=device)
+        else:
+            sum_denomis = denomis[0]
+            for denm in denomis[1:]:
+                sum_denomis += denm
+            sum_cxt_layers = None
+            for ctx_ly, denm in zip(ctx_layers, denomis):
+                alpha = torch.div(denm, sum_denomis)
+                alpha = torch.nan_to_num(alpha)
+                scaled_ctx_ly = ctx_ly * alpha
+                if sum_cxt_layers is None:
+                    sum_cxt_layers = scaled_ctx_ly
+                else:
+                    sum_cxt_layers += scaled_ctx_ly
+            context_layer = sum_cxt_layers
+        context_layer = context_layer.view(
+            context_layer.size(0), context_layer.size(1), context_layer.size(2) * context_layer.size(3)
+        )
+
+        return context_layer
 
     def _pre_pipeline_per_level(self, q, k, v, level, tf_shared_dict, is_prompt):
         is_first_layer = False
@@ -1085,11 +1368,30 @@ class MLSAPipelineAttn(torch.nn.Module):
                     for h in range(NUM_HEADS):
                         token_idx = i * sparse_degree + h % sparse_degree
                         rc_indices_tensor[token_idx][h] = i
-                tf_shared_dict[f"{level}:rc_indices_ts"] = rc_indices_tensor
+                if group_size == 1:
+                    tf_shared_dict[f"{level}:rc_indices_ts"] = rc_indices_tensor
+                else:
+                    ASSERT(NUM_HEADS % group_size == 0)
+                    nhead_per_rank = NUM_HEADS // group_size
+                    head_step = MUL_LEV_SPA_ATN_MICRO_BATCH_HEAD_SIZES[level]
+                    rem_head = nhead_per_rank
+                    index = 0
+                    hd_splt_idx = []
+                    while True:
+                        if rem_head > head_step:
+                            rem_head -= head_step
+                            index += head_step
+                            hd_splt_idx.append(index)
+                        else:
+                            break
+                    rc_idx_tsrs = []
+                    for tsr_per_rank in torch.split(rc_indices_tensor, nhead_per_rank, dim=1):
+                        rc_idx_tsrs.append(torch.tensor_split(tsr_per_rank, hd_splt_idx, dim=1))
+                    tf_shared_dict[f"{level}:rc_indices_ts"] = rc_idx_tsrs
         else:
             if sparse_degree > 1:
                 indices_tensor = tf_shared_dict[f"{level}:indices_ts"]
-                rc_indices_tensor = tf_shared_dict[f"{level}:rc_indices_ts"]
+                # rc_indices_tensor = tf_shared_dict[f"{level}:rc_indices_ts"]
 
         if sparse_degree > 1:
             k_ = k.gather(0, indices_tensor)
@@ -1105,8 +1407,21 @@ class MLSAPipelineAttn(torch.nn.Module):
 
         self.lv_qkv[level] = {"q": q_, "k": k_, "v": v_}
 
-        # if group size is 1, do nothing
-        if group_size == 1:
+        # if group size is 1, do nothing but mask
+        if group_size == 1:  # Means that this level only needs lv_qkv and the local mask
+            # prepare mask
+            if is_first_layer:
+                # num of q kv could be zero
+                nqt = q_.size(0)
+                nkvt = k_.size(0)
+                attn_mask = torch.tril(torch.ones((1, nkvt, nkvt), device=q.device)).view(1, 1, nkvt, nkvt)
+                attn_mask = attn_mask < 0.5
+                attn_mask = torch.concat([attn_mask for _ in range(batch_size)])
+                attn_mask = attn_mask[..., nkvt - nqt : nkvt, :nkvt]
+                self.masks[level] = attn_mask
+                tf_shared_dict[f"{level}:mask"] = attn_mask
+            else:
+                self.masks[level] = tf_shared_dict[f"{level}:mask"]
             return
 
         num_q_tokens = q_.size(0)
@@ -1180,8 +1495,12 @@ class MLSAPipelineAttn(torch.nn.Module):
             split_tensors = torch.split(qkv_tsr, num_head_per_node, dim=2)
             ASSERT(len(split_tensors) == group_size)
             for i, tsr_per_node in enumerate(split_tensors):
+                # self.data_to_transf could have token with size 0 for the local rank
+                # but for other rank it only uses an empty list [] or tuple (,) to indciate the num of tokens is 0
                 if i == local_rank:
-                    self.data_to_transf[level][qkv_type].append(tsr_per_node)
+                    self.data_to_transf[level][qkv_type].append(
+                        torch.tensor_split(tsr_per_node, head_micro_split_indices, dim=2)
+                    )
                 else:
                     hmst_lst = []
                     hms_tsr = torch.tensor_split(tsr_per_node, head_micro_split_indices, dim=2)
@@ -1203,6 +1522,7 @@ class MLSAPipelineAttn(torch.nn.Module):
         # prepare data to receive
         if is_first_layer:
             # data_to_recv_one_lv = {"q": [], "k": [], "v": []}  # [q/k/v][node_part][h_micro_part][token_part]
+            # self.data_to_recv uses None for local rank but uses [] or (,) to indicate the number of tokens is 0
             q_step = MUL_LEV_SPA_ATN_MICRO_BATCH_Q_TOKEN_SIZES[level]
             # kv_step = MUL_LEV_SPA_ATN_MICRO_BATCH_KV_TOKEN_SIZES[level]
             head_step = MUL_LEV_SPA_ATN_MICRO_BATCH_HEAD_SIZES[level]
@@ -1284,6 +1604,53 @@ class MLSAPipelineAttn(torch.nn.Module):
         else:
             self.masks[level] = tf_shared_dict[f"{level}:mask"]
 
+        # prepare ctx outputs list
+        if is_first_layer:
+            # get the max number of q partitions
+            all_num_q_parts = []
+            for grank in range(group_size):
+                if grank == local_rank:
+                    other_rank = (grank + 1) % group_size
+                    the_lst = self.data_to_transf[level]["q"][other_rank][0]
+                    ASSERT(isinstance(the_lst, (list, tuple)))
+                    the_num = len(the_lst)
+                else:
+                    the_lst = self.data_to_receive[level]["q"][grank][0]
+                    ASSERT(isinstance(the_lst, (list, tuple)))
+                    the_num = len(the_lst)
+                all_num_q_parts.append(the_num)
+            max_num = np.max(all_num_q_parts)
+            nhead_per_rank = NUM_HEADS // group_size
+            num_head_micro_parts = (
+                nhead_per_rank // head_step if nhead_per_rank % head_step == 0 else nhead_per_rank // head_step + 1
+            )
+            for micro_hd_idx in range(num_head_micro_parts):
+                ctx_outputs_lst = [[] for _ in range(max_num)]
+                self.ctx_outputs[level][micro_hd_idx] = ctx_outputs_lst
+                for a2a_idx in range(max_num):
+                    ctx_outputs = ctx_outputs_lst[a2a_idx]
+                    for grank in range(group_size):
+                        if grank == local_rank:
+                            ctx_outputs.append(torch.tensor([], dtype=q.dtype, device=q.device))
+                        else:
+                            tsr_lst = self.data_to_transf[level]["q"][grank][micro_hd_idx]
+                            if len(tsr_lst) <= a2a_idx:
+                                ctx_outputs.append(torch.tensor([], dtype=q.dtype, device=q.device))
+                            else:
+                                the_shape = tsr_lst[a2a_idx].shape
+                                ctx_outputs.append(
+                                    torch.empty([*(the_shape[:3]), the_shape[-1] + 1], dtype=q.dtype, device=q.device)
+                                )
+            tf_shared_dict[f"{level}:max_num_q_part"] = max_num
+            tf_shared_dict[f"{level}:num_hd_micro_part"] = num_head_micro_parts
+            tf_shared_dict[f"{level}:ctx_output"] = self.ctx_outputs[level]
+        else:
+            max_num = tf_shared_dict[f"{level}:max_num_q_part"]
+            num_head_micro_parts = tf_shared_dict[f"{level}:num_hd_micro_part"]
+            self.ctx_outputs[level] = tf_shared_dict[f"{level}:ctx_output"]
+        self.lv_max_num_q_parts[level] = max_num
+        self.lv_num_head_micro_parts[level] = num_head_micro_parts
+
 
 class MLSAttention(torch.nn.Module):
     def __init__(self, layer_num, precision, *args, **kwargs) -> None:
@@ -1299,7 +1666,7 @@ class MLSAttention(torch.nn.Module):
         # for lev in range(len(MUL_LEV_SPA_ATN_GRP_SIZES)):
         #     self.mlsa_attns.append(MLSAForOneLevel(lev, self.core_attention))
         # self.mlsa_attns = torch.nn.ModuleList(self.mlsa_attns)
-        self.attention = MLSAPipelineAttn()
+        self.attention = MLSAPipelineAttn(MLSASoftmaxQK(layer_num, precision), MLSAV())
         self.dense = AttnOutputLinear()
 
         # Inference key-value memory
@@ -1919,7 +2286,11 @@ class DistributedGPTModel(torch.nn.Module):
                         split_indices.append(i * CONTEXT_LEN + remaining_len)
                         break
                 tokens2use_list = [t.contiguous() for t in torch.tensor_split(tokens2use, split_indices, 1)]
+                if len(tokens2use_list) > self.num_wrks:
+                    tokens2use_list.pop()
                 positions2use_list = [t.contiguous() for t in torch.tensor_split(positions2use, split_indices, 1)]
+                if len(positions2use_list) > self.num_wrks:
+                    positions2use_list.pop()
                 if len(tokens2use_list) < self.num_wrks:
                     for _ in range(self.num_wrks - len(tokens2use_list)):
                         tokens2use_list.append(torch.empty([batch_size, 0], dtype=tokens2use.dtype))
