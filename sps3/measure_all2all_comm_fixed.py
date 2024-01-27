@@ -24,12 +24,12 @@ from megatron.model.fused_softmax import FusedScaleMaskSoftmax
 
 # These hyper-parameters are noly for GPTModel rather than DistributedGPTModel
 IS_TRAINING = False
-CONTEXT_LEN = 2048
-HIDDEN_SIZE = 2048
-FFN_HIDDEN_SIZE = 3072
-NUM_HEADS = 16
+CONTEXT_LEN = 4096
+HIDDEN_SIZE = 5120
+FFN_HIDDEN_SIZE = 5120 * 4
+NUM_HEADS = 40
 VOCAB_SIZE = 50304
-NUM_LAYERS = 24
+NUM_LAYERS = 40
 assert HIDDEN_SIZE % NUM_HEADS == 0
 
 
@@ -115,6 +115,9 @@ class CoreAttention(torch.nn.Module):
         # Raw attention scores. [b, np, s, s]
         # ===================================
 
+        torch.cuda.synchronize()
+        qkv_time0 = time.time()
+
         # [b, np, sq, sk]
         output_size = (query_layer.size(1), query_layer.size(2), query_layer.size(0), key_layer.size(0))
 
@@ -128,6 +131,10 @@ class CoreAttention(torch.nn.Module):
         # matmul_input_buffer = torch.empty(
         #     output_size[0] * output_size[1], output_size[2], output_size[3], dtype=query_layer.dtype
         # )
+
+        torch.cuda.synchronize()
+        score_time0 = time.time()
+
         matmul_input_buffer = torch.empty(1, device=query_layer.device)
 
         # Raw attention scores. [b * np, sq, sk]
@@ -139,11 +146,22 @@ class CoreAttention(torch.nn.Module):
             alpha=(1.0 / self.norm_factor),
         )
 
+
+
         # change view to [b, np, sq, sk]
         attention_scores = matmul_result.view(*output_size)
 
+        torch.cuda.synchronize()
+        score_time = (time.time() - score_time0) * 1000
+
+
+        softmax_time0 = time.time()
+
         # attention scores and attention mask [b, np, sq, sk]
         attention_probs = self.scale_mask_softmax(attention_scores, attention_mask)
+
+        torch.cuda.synchronize()
+        softmax_time = (time.time() - softmax_time0) * 1000
 
         # This is actually dropping out entire tokens to attend to, which might
         # seem a bit unusual, but is taken from the original Transformer paper.
@@ -166,7 +184,12 @@ class CoreAttention(torch.nn.Module):
         attention_probs = attention_probs.view(output_size[0] * output_size[1], output_size[2], -1)
 
         # matmul: [b * np, sq, hn]
+        torch.cuda.synchronize()
+        v_time0 = time.time()
         context_layer = torch.bmm(attention_probs, value_layer.transpose(0, 1))
+
+        torch.cuda.synchronize()
+        v_time = (time.time() - v_time0) * 1000
 
         # change view [b, np, sq, hn]
         context_layer = context_layer.view(*output_size)
@@ -178,7 +201,10 @@ class CoreAttention(torch.nn.Module):
         new_context_layer_shape = context_layer.size()[:-2] + (context_layer.size(2) * context_layer.size(3),)
         context_layer = context_layer.view(*new_context_layer_shape)
 
-        return context_layer
+        torch.cuda.synchronize()
+        qkv_time = (time.time() - qkv_time0) * 1000
+
+        return context_layer, qkv_time, score_time, softmax_time, v_time
 
 
 class _SeqAllToAll(torch.autograd.Function):
@@ -287,7 +313,7 @@ class DistributedAttention(torch.nn.Module):
         a2a1_time = (time1 - time0) * 1000
 
         # out shape : e.g., [s:h/p:]
-        context_layer = self.local_attn(query_layer, key_layer, value_layer, args[0])
+        context_layer, qkv_time, score_time, softmax_time, v_time = self.local_attn(query_layer, key_layer, value_layer, args[0])
 
         torch.cuda.synchronize()
         time0 = time.time()
@@ -297,7 +323,7 @@ class DistributedAttention(torch.nn.Module):
         a2a2_time = (time1 - time0) * 1000
 
         # out e.g., [s/p::h]
-        return output, a2a1_time + a2a2_time, a2a1_time, a2a2_time
+        return output, a2a1_time + a2a2_time, a2a1_time, a2a2_time, qkv_time, score_time, softmax_time, v_time
 
 
 class AttnOutputLinear(torch.nn.Module):
@@ -369,6 +395,11 @@ class Attention(torch.nn.Module):
         # =================================================
         # Pre-allocate memory for key-values for inference.
         # =================================================
+
+        torch.cuda.synchronize()
+        malloc_time0 = time.time()
+        attn_time0 = time.time()
+
         if set_inference_key_value_memory:
             assert inference_max_sequence_len is not None and inference_max_sequence_len >= 0
             self.inference_key_memory = self._allocate_memory(
@@ -390,6 +421,10 @@ class Attention(torch.nn.Module):
             self.inference_key_memory = None
             self.inference_value_memory = None
 
+        torch.cuda.synchronize()
+        malloc_time1 = time.time()
+        malloc_time = (malloc_time1 - malloc_time0) * 1000
+
         # =====================
         # Query, Key, and Value
         # =====================
@@ -410,8 +445,7 @@ class Attention(torch.nn.Module):
         # ===================================================
         # Adjust key, value, and attention mask for inference
         # ===================================================
-        torch.cuda.synchronize()
-        malloc_time0 = time.time()
+
         if inference_max_sequence_len is not None:
             # Adjust the range variables.
             start = self.inference_current_sequence_len
@@ -422,11 +456,9 @@ class Attention(torch.nn.Module):
             self.inference_value_memory[start:end, ...] = value_layer
             key_layer = self.inference_key_memory[:end, ...]
             value_layer = self.inference_value_memory[:end, ...]
-        torch.cuda.synchronize()
-        malloc_time1 = time.time()
-        malloc_time = (malloc_time1 - malloc_time0) * 1000
 
-        context_layer, a2a_time, a2a1_time, a2a2_time = self.dist_attention(
+
+        context_layer, a2a_time, a2a1_time, a2a2_time, qkv_time, score_time, softmax_time, v_time = self.dist_attention(
             query_layer,
             key_layer,
             value_layer,
@@ -437,7 +469,10 @@ class Attention(torch.nn.Module):
 
         output, bias = self.dense(context_layer)
 
-        return output, bias, a2a_time, a2a1_time, a2a2_time, malloc_time
+        torch.cuda.synchronize()
+        attn_time = (time.time() - attn_time0) * 1000
+
+        return output, bias, a2a_time, a2a1_time, a2a2_time, malloc_time, qkv_time, score_time, softmax_time, v_time, attn_time
 
     def _allocate_memory(self, inference_max_sequence_len, batch_size, dtype, device):
         return torch.empty(
@@ -567,10 +602,20 @@ class TransformerLayer(torch.nn.Module):
         self.all2all1_time = 0
         self.all2all2_time = 0
         self.malloc_time = 0
+        self.mlp_time = 0
+        self.qkv_time = 0
+        self.score_time = 0
+        self.softmax_time = 0
+        self.v_time = 0
+        self.layer_time = 0
+        self.attn_time = 0
+        self.lynorm_time = 0
 
     def forward(self, hidden_states, attention_mask, set_inference_key_value_memory=False, inference_max_sequence_len=None):
+        torch.cuda.synchronize()
+        layertime0 = time.time()
         layernorm_output = self.input_layernorm(hidden_states)
-        attention_output, attention_bias, a2a_time, a2a1_time, a2a2_time, malloc_time = self.self_attention(
+        attention_output, attention_bias, a2a_time, a2a1_time, a2a2_time, malloc_time, qkv_time, score_time, softmax_time, v_time, attn_time = self.self_attention(
             layernorm_output, attention_mask, set_inference_key_value_memory, inference_max_sequence_len
         )
 
@@ -578,6 +623,14 @@ class TransformerLayer(torch.nn.Module):
         self.all2all1_time = a2a1_time
         self.all2all2_time = a2a2_time
         self.malloc_time = malloc_time
+        self.qkv_time = qkv_time
+        self.score_time = score_time
+        self.softmax_time = softmax_time
+        self.v_time = v_time
+        self.attn_time = attn_time
+
+        torch.cuda.synchronize()
+        lynorm_time0 = time.time()
 
         residual = hidden_states
         if IS_TRAINING:
@@ -591,9 +644,15 @@ class TransformerLayer(torch.nn.Module):
         layernorm_output = self.post_attention_layernorm(layernorm_input)
 
         # MLP.
+        torch.cuda.synchronize()
+        self.lynorm_time = (time.time() - lynorm_time0) * 1000
+        mlp_time_0 = time.time()
         mlp_bias = torch.tensor(0.0, device=layernorm_output.device, dtype=layernorm_output.dtype)
 
         mlp_output, mlp_bias = self.mlp(layernorm_output)
+
+        torch.cuda.synchronize()
+        self.mlp_time = (time.time() - mlp_time_0) * 1000
 
         residual = layernorm_input
 
@@ -602,6 +661,9 @@ class TransformerLayer(torch.nn.Module):
         with self.bias_dropout_add_exec_handler():
             output = bias_dropout_add_func(mlp_output, mlp_bias, residual, self.hidden_dropout)
         output = core.utils.make_viewless_tensor(inp=output, requires_grad=output.requires_grad, keep_graph=True)
+        torch.cuda.synchronize()
+
+        self.layer_time = (time.time() - layertime0) * 1000
 
         return output
 
@@ -670,6 +732,14 @@ class Transformer(torch.nn.Module):
         all2all1_time = 0
         all2all2_time = 0
         malloc_time = 0
+        mlp_time = 0
+        qkv_time = 0
+        score_time = 0
+        softmax_time = 0
+        v_time = 0
+        layer_time = 0
+        attn_time = 0
+        lynorm_time = 0
 
         if self.precision == 16:
             for ly in range(NUM_LAYERS):
@@ -681,6 +751,14 @@ class Transformer(torch.nn.Module):
                     all2all1_time += layer.all2all1_time
                     all2all2_time += layer.all2all2_time
                     malloc_time += layer.malloc_time
+                    mlp_time += layer.mlp_time
+                    qkv_time += layer.qkv_time
+                    score_time += layer.score_time
+                    softmax_time += layer.softmax_time
+                    v_time += layer.v_time
+                    layer_time += layer.layer_time
+                    attn_time += layer.attn_time
+                    lynorm_time += layer.lynorm_time
         else:
             for ly in range(NUM_LAYERS):
                 hidden_states, layer = custom(ly, ly + 1)(
@@ -690,11 +768,27 @@ class Transformer(torch.nn.Module):
                 all2all1_time += layer.all2all1_time
                 all2all2_time += layer.all2all2_time
                 malloc_time += layer.malloc_time
+                mlp_time += layer.mlp_time
+                qkv_time += layer.qkv_time
+                score_time += layer.score_time
+                softmax_time += layer.softmax_time
+                v_time += layer.v_time
+                layer_time += layer.layer_time
+                attn_time += layer.attn_time
+                lynorm_time += layer.lynorm_time
 
         print(f"all2all time: {all2all_time}")
         print(f"first all2all time: {all2all1_time}")
         print(f"second all2all time: {all2all2_time}")
         print(f"Malloc time: {malloc_time}")
+        print(f"MLP time: {mlp_time}")
+        print(f"QKV time: {qkv_time}")
+        print(f"Score time: {score_time}")
+        print(f"Softmax time: {softmax_time}")
+        print(f"V time: {v_time}")
+        print(f"Layer time: {layer_time}")
+        print(f"Attn time: {attn_time}")
+        print(f"Layer-norm time: {lynorm_time}")
 
         hidden_states = self.final_layernorm(hidden_states)
 
@@ -740,10 +834,10 @@ class GPTModel(torch.nn.Module):
         return logits.transpose(0, 1).contiguous()
 
     def _init_model(self, param_pickle_path):
-        with open(param_pickle_path, "rb") as file:
-            params = pickle.load(file)
-        for (key, _), (_, param) in zip(self.named_parameters(), params):
-            self.state_dict()[key].copy_(param)
+        # with open(param_pickle_path, "rb") as file:
+        #     params = pickle.load(file)
+        # for (key, _), (_, param) in zip(self.named_parameters(), params):
+        #     self.state_dict()[key].copy_(param)
         self.to(self.device)
 
 
@@ -1157,11 +1251,11 @@ if __name__ == "__main__":
     config["param_path"] = "/u/qxc4fh/zeyu_workspace/gpt_params.pkl"
     config["tokenizer_path"] = "/u/qxc4fh/zeyu_workspace/gpt_tokenizer_kernel.pkl"
     config["precision"] = 16
-    config["devices"] = ["cuda:0", "cuda:1", "cuda:2", "cuda:3"]
+    config["devices"] = [f"cuda:{i}" for i in range(8)]
     config["num_wrk"] = len(config["devices"])
 
-    test_str = "test " * (2048 * 3 + 2047)
-    test_str = "test " * 1
+    test_str = "test " * (CONTEXT_LEN * (len(config["devices"] - 1)) + CONTEXT_LEN - 1)
+    # test_str = "test my be" * 1
     test_str = test_str.strip()
 
     DistributedGPTModel(config).run([test_str], 1)
