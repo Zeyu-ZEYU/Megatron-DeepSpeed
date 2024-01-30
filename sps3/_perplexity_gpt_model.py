@@ -93,7 +93,7 @@ def attention_mask_func(attention_scores, attention_mask):
 
 tkimp_unimp_tkids = []  # [ids_in_a_layer, ids_in_a_layer, ...]
 
-attn_dist = 1500
+attn_dist = 1150
 dist_mask = torch.ones([2048, 2048], dtype=torch.int64, device=torch.device("cuda:0")) < 0
 for qid in range(2048):
     end = qid - attn_dist

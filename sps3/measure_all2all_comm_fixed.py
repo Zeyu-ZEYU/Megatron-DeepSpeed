@@ -24,12 +24,12 @@ from megatron.model.fused_softmax import FusedScaleMaskSoftmax
 
 # These hyper-parameters are noly for GPTModel rather than DistributedGPTModel
 IS_TRAINING = False
-CONTEXT_LEN = 4096
-HIDDEN_SIZE = 5120
-FFN_HIDDEN_SIZE = 5120 * 4
-NUM_HEADS = 40
+CONTEXT_LEN = 1
+HIDDEN_SIZE = 2048
+FFN_HIDDEN_SIZE = HIDDEN_SIZE * 4
+NUM_HEADS = 16
 VOCAB_SIZE = 50304
-NUM_LAYERS = 40
+NUM_LAYERS = 24
 assert HIDDEN_SIZE % NUM_HEADS == 0
 
 
@@ -146,14 +146,11 @@ class CoreAttention(torch.nn.Module):
             alpha=(1.0 / self.norm_factor),
         )
 
-
-
         # change view to [b, np, sq, sk]
         attention_scores = matmul_result.view(*output_size)
 
         torch.cuda.synchronize()
         score_time = (time.time() - score_time0) * 1000
-
 
         softmax_time0 = time.time()
 
@@ -313,7 +310,9 @@ class DistributedAttention(torch.nn.Module):
         a2a1_time = (time1 - time0) * 1000
 
         # out shape : e.g., [s:h/p:]
-        context_layer, qkv_time, score_time, softmax_time, v_time = self.local_attn(query_layer, key_layer, value_layer, args[0])
+        context_layer, qkv_time, score_time, softmax_time, v_time = self.local_attn(
+            query_layer, key_layer, value_layer, args[0]
+        )
 
         torch.cuda.synchronize()
         time0 = time.time()
@@ -456,7 +455,6 @@ class Attention(torch.nn.Module):
             self.inference_value_memory[start:end, ...] = value_layer
             key_layer = self.inference_key_memory[:end, ...]
             value_layer = self.inference_value_memory[:end, ...]
-
 
         context_layer, a2a_time, a2a1_time, a2a2_time, qkv_time, score_time, softmax_time, v_time = self.dist_attention(
             query_layer,
@@ -615,9 +613,19 @@ class TransformerLayer(torch.nn.Module):
         torch.cuda.synchronize()
         layertime0 = time.time()
         layernorm_output = self.input_layernorm(hidden_states)
-        attention_output, attention_bias, a2a_time, a2a1_time, a2a2_time, malloc_time, qkv_time, score_time, softmax_time, v_time, attn_time = self.self_attention(
-            layernorm_output, attention_mask, set_inference_key_value_memory, inference_max_sequence_len
-        )
+        (
+            attention_output,
+            attention_bias,
+            a2a_time,
+            a2a1_time,
+            a2a2_time,
+            malloc_time,
+            qkv_time,
+            score_time,
+            softmax_time,
+            v_time,
+            attn_time,
+        ) = self.self_attention(layernorm_output, attention_mask, set_inference_key_value_memory, inference_max_sequence_len)
 
         self.all2all_time = a2a_time
         self.all2all1_time = a2a1_time
@@ -1249,12 +1257,12 @@ if __name__ == "__main__":
     config["master_ip"] = "127.0.0.1"
     config["master_port"] = 34565
     config["param_path"] = "/u/qxc4fh/zeyu_workspace/gpt_params.pkl"
-    config["tokenizer_path"] = "/u/qxc4fh/zeyu_workspace/gpt_tokenizer_kernel.pkl"
+    config["tokenizer_path"] = "./gpt_tokenizer_kernel.pkl"
     config["precision"] = 16
-    config["devices"] = [f"cuda:{i}" for i in range(8)]
+    config["devices"] = ["cuda:0", "cuda:1"]
     config["num_wrk"] = len(config["devices"])
 
-    test_str = "test " * (CONTEXT_LEN * (len(config["devices"] - 1)) + CONTEXT_LEN - 1)
+    test_str = "test " * (CONTEXT_LEN * (len(config["devices"]) - 1) + CONTEXT_LEN - 1)
     # test_str = "test my be" * 1
     test_str = test_str.strip()
 
