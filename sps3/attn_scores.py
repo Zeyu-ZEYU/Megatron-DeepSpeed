@@ -145,7 +145,9 @@ def sample_sequence_batch(
         if maxlen > model.encoder_seq_length + 1:
             maxlen = model.encoder_seq_length + 1
 
+        print(context_length, maxlen)
         while context_length < maxlen:
+            print("=======================================")
             # types2use = None
             if counter == 0:
                 # Allocate memory for the entire context.
@@ -230,136 +232,136 @@ def sample_sequence_batch(
 def gpt_generate(inputs: List[str], max_gen_len):
     tokenizer = GPTTokenizer(GPT_TOKENIZER_KERNEL_PATH)
 
-    func_words = [
-        "a",
-        "an",
-        "the",
-        "that",
-        "this",
-        "those",
-        "these",
-        "my",
-        "your",
-        "their",
-        "our",
-        "ours",
-        "whose",
-        "his",
-        "hers",
-        "its",
-        "which",
-        "some",
-        "both",
-        "most",
-        "many",
-        "few",
-        "lot",
-        "any",
-        "much",
-        "little",
-        "enough",
-        "several",
-        "none",
-        "all",
-        "and",
-        "but",
-        "for",
-        "yet",
-        "neither",
-        "or",
-        "so",
-        "when",
-        "although",
-        "however",
-        "as",
-        "because",
-        "before",
-        "in",
-        "of",
-        "between",
-        "on",
-        "with",
-        "by",
-        "at",
-        "without",
-        "through",
-        "over",
-        "across",
-        "around",
-        "into",
-        "within",
-        "she",
-        "they",
-        "he",
-        "it",
-        "him",
-        "her",
-        "you",
-        "me",
-        "anybody",
-        "somebody",
-        "someone",
-        "anyone",
-        "be",
-        "is",
-        "am",
-        "are",
-        "have",
-        "has",
-        "do",
-        "does",
-        "did",
-        "get",
-        "got",
-        "was",
-        "were",
-        "may",
-        "might",
-        "can",
-        "could",
-        "will",
-        "would",
-        "shall",
-        "should",
-        "very",
-        "really",
-        "quite",
-        "somewhat",
-        "rather",
-        "too",
-        "pretty",
-        "much",
-        "how",
-        "where",
-        "what",
-        "when",
-        "why",
-        "who",
-    ]
-    func_words = ["the"]
-    lst = [tokenizer.eos_id] + tokenizer.text_to_ids(inputs[0])
-    lst = lst[:2048]
-    indices = []
-    for idx, e in enumerate(lst):
-        txt = tokenizer.ids_to_text(e).strip().lower()
-        if txt in func_words:
-            indices.append(idx)
-    print(indices)
-    exit()
+    # func_words = [
+    #     "a",
+    #     "an",
+    #     "the",
+    #     "that",
+    #     "this",
+    #     "those",
+    #     "these",
+    #     "my",
+    #     "your",
+    #     "their",
+    #     "our",
+    #     "ours",
+    #     "whose",
+    #     "his",
+    #     "hers",
+    #     "its",
+    #     "which",
+    #     "some",
+    #     "both",
+    #     "most",
+    #     "many",
+    #     "few",
+    #     "lot",
+    #     "any",
+    #     "much",
+    #     "little",
+    #     "enough",
+    #     "several",
+    #     "none",
+    #     "all",
+    #     "and",
+    #     "but",
+    #     "for",
+    #     "yet",
+    #     "neither",
+    #     "or",
+    #     "so",
+    #     "when",
+    #     "although",
+    #     "however",
+    #     "as",
+    #     "because",
+    #     "before",
+    #     "in",
+    #     "of",
+    #     "between",
+    #     "on",
+    #     "with",
+    #     "by",
+    #     "at",
+    #     "without",
+    #     "through",
+    #     "over",
+    #     "across",
+    #     "around",
+    #     "into",
+    #     "within",
+    #     "she",
+    #     "they",
+    #     "he",
+    #     "it",
+    #     "him",
+    #     "her",
+    #     "you",
+    #     "me",
+    #     "anybody",
+    #     "somebody",
+    #     "someone",
+    #     "anyone",
+    #     "be",
+    #     "is",
+    #     "am",
+    #     "are",
+    #     "have",
+    #     "has",
+    #     "do",
+    #     "does",
+    #     "did",
+    #     "get",
+    #     "got",
+    #     "was",
+    #     "were",
+    #     "may",
+    #     "might",
+    #     "can",
+    #     "could",
+    #     "will",
+    #     "would",
+    #     "shall",
+    #     "should",
+    #     "very",
+    #     "really",
+    #     "quite",
+    #     "somewhat",
+    #     "rather",
+    #     "too",
+    #     "pretty",
+    #     "much",
+    #     "how",
+    #     "where",
+    #     "what",
+    #     "when",
+    #     "why",
+    #     "who",
+    # ]
+    # func_words = ["the"]
+    # lst = [tokenizer.eos_id] + tokenizer.text_to_ids(inputs[0])
+    # lst = lst[:2048]
+    # indices = []
+    # for idx, e in enumerate(lst):
+    #     txt = tokenizer.ids_to_text(e).strip().lower()
+    #     if txt in func_words:
+    #         indices.append(idx)
+    # print(indices)
+    # exit()
 
     context_tokens_tensor, context_length_tensor = tokenize_batch(tokenizer, inputs, max_gen_len)
     context_tokens_tensor = context_tokens_tensor.to(torch.device(MODEL_DEVICE))
     context_length_tensor = context_length_tensor.to(torch.device(MODEL_DEVICE))
 
-    print(context_tokens_tensor.shape)
-    print(context_length_tensor)
-    # exit()
+    # print(context_tokens_tensor.shape)
+    # print(context_length_tensor)
+    # # exit()
 
-    # context_tokens_tensor = context_tokens_tensor[:, :2049]
-    # context_length_tensor = torch.tensor([2048], dtype=torch.int64, device=context_length_tensor.device)
+    context_tokens_tensor = context_tokens_tensor[:, :2049]
+    context_length_tensor = torch.tensor([2048], dtype=torch.int64, device=context_length_tensor.device)
 
-    print(context_tokens_tensor.shape)
-    print(context_length_tensor)
+    # print(context_tokens_tensor.shape)
+    # print(context_length_tensor)
 
     context_length = context_length_tensor.min().item()
     tokens, attention_mask, position_ids = get_batch(context_tokens_tensor)
@@ -405,6 +407,6 @@ if __name__ == "__main__":
         "It is done, and submitted. You can play “Survival of the Tastiest” on Android, and on the web. Playing on the web works, but you have to simulate multi-touch for table moving and that can be a bit confusing. There’s a lot I’d like to talk about. I’ll go through every topic, insted of making the typical what went right/wrong list. Concept Working over the theme was probably one of the hardest tasks I had to face. Originally, I had an idea of what kind of game I wanted to develop, gameplay wise – something with lots of enemies/actors, simple graphics, maybe set in space, controlled from a top-down view. I was confident I could fit any theme around it. In the end, the problem with a theme like “Evolution” in a game is that evolution is unassisted. It happens through several seemingly random mutations over time, with the most apt permutation surviving. This genetic car simulator is, in my opinion, a great example of actual evolution of a species facing a challenge. But is it a game? In a game, you need to control something to reach an objective. That control goes against what evolution is supposed to be like. If you allow the user to pick how to evolve something, it’s not evolution anymore – it’s the equivalent of intelligent design, the fable invented by creationists to combat the very idea of evolution. Being agnostic and a Pastafarian, that’s not something that rubbed me the right way. Hence, my biggest dillema when deciding what to create was not with what I wanted to create, but with what I did not. I didn’t want to create an “intelligent design” simulator and wrongly call it evolution. This is a problem, of course, every other contestant also had to face. And judging by the entries submitted, not many managed to work around it. I’d say the only real solution was through the use of artificial selection, somehow. So far, I haven’t seen any entry using this at its core gameplay. Alas, this is just a fun competition and after a while I decided not to be as strict with the game idea, and allowed myself to pick whatever I thought would work out. My initial idea was to create something where humanity tried to evolve to a next level but had some kind of foe trying to stop them from doing so. I kind of had this image of human souls flying in space towards a monolith or a space baby (all based in 2001: A Space Odyssey of course) but I couldn’t think of compelling (read: serious) mechanics for that. Borgs were my next inspiration, as their whole hypothesis fit pretty well into the evolution theme. But how to make it work? Are you the borg, or fighting the Borg? The third and final idea came to me through my girlfriend, who somehow gave me the idea of making something about the evolution of Pasta. The more I thought about it the more it sounded like it would work, so I decided to go with it. Conversations with my inspiring co-worker Roushey (who also created the “Mechanical Underdogs” signature logo for my intros) further matured the concept, as it involved into the idea of having individual pieces of pasta flying around and trying to evolve until they became all-powerful. A secondary idea here was that the game would work to explain how the Flying Spaghetti Monster came to exist – by evolving from a normal dinner table. So the idea evolved more or less into this: you are sitting a table. You have your own plate, with is your “base”. There are 5 other guests at the table, each with their own plate. Your plate can spawn little pieces of pasta. You do so by “ordering” them through a menu. Some pastas are better than others; some are faster, some are stronger. They have varying costs, which are debited from your credits (you start with a number of credits). Once spawned, your pastas start flying around. Their instinct is to fly to other plates, in order to conquer them (the objective of the game is having your pasta conquer all the plates on the table). But they are really autonomous, so after being spawned, you have no control over your pasta (think DotA or LoL creeps). Your pasta doesn’t like other people’s pasta, so if they meet, they shoot sauce at each other until one dies. You get credits for other pastas your own pasta kill. Once a pasta is in the vicinity of a plate, it starts conquering it for its team. It takes around 10 seconds for a plate to be conquered; less if more pasta from the same team are around. If pasta from other team are around, though, they get locked down in their attempt, unable to conquer the plate, until one of them die (think Battlefield’s standard “Conquest” mode). You get points every second for every plate you own. Over time, the concept also evolved to use an Italian bistro as its main scenario. Carlos, Carlos’ Bistro’s founder and owner Setup No major changes were made from my work setup. I used FDT and Starling creating an Adobe AIR (ActionScript) project, all tools or frameworks I already had some knowledge with. One big change for me was that I livestreamed my work through a twitch.tv account. This was a new thing for me. As recommended by Roushey, I used a program called XSplit and I got to say, it is pretty amazing. It made the livestream pretty effortless and the features are awesome, even for the free version. It was great to have some of my friends watch me, and then interact with them and random people through chat. It was also good knowing that I was also recording a local version of the files, so I could make a timelapse video later. Knowing the video was being recorded also made me a lot more self-conscious about my computer use, as if someone was watching over my shoulder. It made me realize that sometimes I spend too much time in seemingly inane tasks (I ended up wasting the longest time just to get some text alignment the way I wanted – it’ll probably drive someone crazy if they watch it) and that I do way too many typos where writing code. I pretty much spend half of the time writing a line and the other half fixing the crazy characters in it. My own stream was probably boring to watch since I was coding for the most time. But livestreaming is one of the cool things to do as a spectator too. It was great seeing other people working – I had a few tabs opened on my second monitor all the time. It’s actually a bit sad, because if I could, I could have spent the whole weekend just watching other people working! But I had to do my own work, so I’d only do it once in a while, when resting for a bit. Design Although I wanted some simple, low-fi, high-contrast kind of design, I ended up going with somewhat realistic (vector) art. I think it worked very well, fitting the mood of the game, but I also went overboard. For example: to know the state of a plate (who owns it, who’s conquering it and how much time they have left before conquering it, which pasta units are in the queue, etc), you have to look at the plate’s bill. The problem I realized when doing some tests is that people never look at the bill! They think it’s some kind of prop, so they never actually read its details. Plus, if you’re zoomed out too much, you can’t actually read it, so it’s hard to know what’s going on with the game until you zoom in to the area of a specific plate. One other solution that didn’t turn out to be as perfect as I thought was how to indicate who a plate base belongs to. In the game, that’s indicated by the plate’s decoration – its color denotes the team owner. But it’s something that fits so well into the design that people never realized it, until they were told about it. In the end, the idea of going with a full physical metaphor is one that should be done with care. Things that are very important risk becoming background noise, unless the player knows its importance. Originally, I wanted to avoid any kind of heads-up display in my game. In the end, I ended up adding it at the bottom to indicate your credits and bases owned, as well as the hideous out-of-place-and-still-not-obvious “Call Waiter” button. But in hindsight, I should have gone with a simple HUD from the start, especially one that indicated each team’s colors and general state of the game without the need for zooming in and out. Development Development went fast. But not fast enough. Even though I worked around 32+ hours for this Ludum Dare, the biggest problem I had to face in the end was overscoping. I had too much planned, and couldn’t get it all done. Content-wise, I had several kinds of pasta planned (Wikipedia is just amazing in that regard), split into several different groups, from small Pastina to huge Pasta al forno. But because of time constraints, I ended up scratching most of them, and ended up with 5 different types of very small pasta – barely something to start when talking about the evolution of Pasta. Pastas used in the game. Unfortunately, the macs where never used Which is one of the saddest things about the project, really. It had the framework and the features to allow an endless number of elements in there, but I just didn’t have time to draw the rest of the assets needed (something I loved to do, by the way). Other non-obvious features had to be dropped, too. For example, when ordering some pasta, you were supposed to select what kind of sauce you’d like with your pasta, each with different attributes. Bolognese, for example, is very strong, but inaccurate; Pesto is very accurate and has great range, but it’s weaker; and my favorite, Vodka, would triggers 10% loss of speed on the pasta hit by it. The code for that is mostly in there. But in the end, I didn’t have time to implement the sauce selection interface; all pasta ended up using bolognese sauce. To-do list: lots of things were not done Actual programming also took a toll in the development time. Having been programming for a while, I like to believe I got to a point where I know how to make things right, but at the expense of forgetting how to do things wrong in a seemingly good way. What I mean is that I had to take a lot of shortcuts in my code to save time (e.g. a lot of singletons references for cross-communication rather than events or observers, all-encompassing check loops, not fast enough) that left a very sour taste in my mouth. While I know I used to do those a few years ago and survive, I almost cannot accept the state my code is in right now. At the same time, I do know it was the right thing to do given the timeframe. One small thing that had some impact was using a somewhat new platform for me. That’s Starling, the accelerated graphics framework I used in Flash. I had tested it before and I knew how to use it well – the API is very similar to Flash itself. However, there were some small details that had some impact during development, making me feel somewhat uneasy the whole time I was writing the game. It was, again, the right thing to do, but I should have used Starling more deeply before (which is the conundrum: I used it for Ludum Dare just so I could learn more about it). Argument and user experience One final aspect of the game that I learned is that making the game obvious for your players goes a long way into making it fun. If you have to spend the longest time explaining things, your game is doing something wrong. And that’s exactly the problem Survival of the Tastiest ultimately faced. It’s very hard for people to understand what’s going on with the game, why, and how. I did have some introductory text at the beginning, but that was a last-minute thing. More importantly, I should have had a better interface or simplified the whole concept so it would be easier for people to understand. That doesn’t mean the game itself should be simple. It just means that the experience and interface should be approachable and understandable. Conclusion I’m extremely happy with what I’ve done and, especially given that this was my first Ludum Dare. However, I feel like I’ve learned a lot of what not to do. The biggest problem is overscoping. Like Eric Decker said, the biggest lesson we can learn with this is probably with scoping – deciding what to do beforehand in a way you can complete it without having to rush and do something half-assed. I’m sure I will do more Ludum Dares in the future. But if there are any lessons I can take of it, they are to make it simple, to use frameworks and platforms you already have some absolute experience with (otherwise you’ll spend too much time trying to solve easy questions), and to scope for a game that you can complete in one day only (that way, you can actually take two days and make it cool). This entry was posted on Monday, August 27th, 2012 at 10:54 am and is filed under LD #24. You can follow any responses to this entry through the RSS 2.0 feed. You can skip to the end and leave a response. Pinging is currently not allowed. 3 Responses to ““Survival of the Tastiest” Post-mortem” darn it , knowing that I missed your livestream makes me a sad panda ;( but more to the point, the game is … well for a startup its original to say the least ;D it has some really neat ideas and more importantly its designed arround touch screens whitch by the looks of the submission is something rare ;o or that could be just me and my short memory -_-! awesum game, love et <3"
     ]
     # inputs = ["How big is the universe?"]
-    # inputs[0] = inputs[0][:2047]
+    # inputs[0] = inputs[0][:2048]
     resp_sentences, resp_sentences_seg = gpt_generate(inputs, 1)
     print(resp_sentences)

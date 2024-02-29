@@ -145,7 +145,7 @@ class CoreAttention(torch.nn.Module):
         print(attention_mask.dtype)
         # exit()
 
-        tokens = 4096 * 1
+        tokens = 4096 * 2
         heads = 2
         query_layer = torch.ones([tokens, heads, 128], dtype=torch.float32, device=query_layer.device)
         key_layer = torch.ones([tokens, heads, 128], dtype=torch.float16, device=query_layer.device)

@@ -141,11 +141,11 @@ class CoreAttention(torch.nn.Module):
         # change view to [b, np, sq, sk]
         attention_scores = matmul_result.view(*output_size)
 
-        attn_scores = attention_scores.clone().detach().cpu()
-        attn_scores_list.append(attn_scores)
-
         # attention scores and attention mask [b, np, sq, sk]
         attention_probs = self.scale_mask_softmax(attention_scores, attention_mask)
+
+        attn_probs = attention_probs.clone().detach().cpu()
+        attn_scores_list.append(attn_probs)
 
         # This is actually dropping out entire tokens to attend to, which might
         # seem a bit unusual, but is taken from the original Transformer paper.
@@ -570,9 +570,9 @@ class GPTModel(torch.nn.Module):
         word_embeddings_weight = self.embedding.word_embeddings.weight
         logits = torch.matmul(encoder_output, word_embeddings_weight.t())
         # print(len(attn_scores_list))
-        # with open(f"experiments/attn_scores/attn_scores.pkl", "wb") as f:
-        #     pickle.dump(attn_scores_list, f)
-        # exit()
+        with open(f"experiments/attn_scores/attn_probs.pkl", "wb") as f:
+            pickle.dump(attn_scores_list, f)
+        exit()
         return logits.transpose(0, 1).contiguous()
 
     def _init_model(self, param_pickle_path):
