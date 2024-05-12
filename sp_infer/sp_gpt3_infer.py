@@ -9,7 +9,8 @@ import einops
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
-from apex.normalization.fused_layer_norm import MixedFusedLayerNorm
+
+# from apex.normalization.fused_layer_norm import MixedFusedLayerNorm
 from flash_attn.flash_attn_interface import flash_attn_varlen_func
 from torch.nn.parameter import Parameter
 
@@ -320,7 +321,7 @@ class Attention(torch.nn.Module):
         # This is added for safety. In case inference_max_sequence_len
         # is not provided, make sure there is no potential memory left
         # from previous inference.
-        if not inference_max_sequence_len:
+        if inference_max_sequence_len is None:
             self.inference_key_memory = None
             self.inference_value_memory = None
 
@@ -448,13 +449,13 @@ class TransformerLayer(torch.nn.Module):
     def __init__(self, layer_num, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self.layer_num = layer_num
-        self.input_layernorm = MixedFusedLayerNorm(HIDDEN_SIZE, 1e-5, sequence_parallel_enbaled=False)
+        self.input_layernorm = torch.nn.LayerNorm(HIDDEN_SIZE, 1e-5)
         # Self attention.
         self.self_attention = Attention(layer_num)
 
         self.hidden_dropout = 0.1
 
-        self.post_attention_layernorm = MixedFusedLayerNorm(HIDDEN_SIZE, 1e-5, sequence_parallel_enbaled=False)
+        self.post_attention_layernorm = torch.nn.LayerNorm(HIDDEN_SIZE, 1e-5)
 
         # MLP
         self.mlp = MLP()
@@ -507,7 +508,7 @@ class Transformer(torch.nn.Module):
             self.layers.append(_build_layer(layer_num))
         self.layers = torch.nn.ModuleList(self.layers)
 
-        self.final_layernorm = MixedFusedLayerNorm(HIDDEN_SIZE, 1e-5, sequence_parallel_enbaled=False)
+        self.final_layernorm = torch.nn.LayerNorm(HIDDEN_SIZE, 1e-5)
 
     def _get_layer(self, layer_number):
         return self.layers[layer_number]
@@ -1019,4 +1020,4 @@ if __name__ == "__main__":
                 conn.send(cmds)
                 conn.close()
             dist_gpt_model = DistributedGPTModel()
-            dist_gpt_model.run_master(["How big is the universe?", "How big is the universe?"], 50)
+            dist_gpt_model.run_master(["How big is the universe?"], 100)
