@@ -208,11 +208,7 @@ class _DistributedAttention(torch.nn.Module):
         num_tokens = query.size(0)
         num_tokens_tensor = torch.tensor(num_tokens, device=query.device)
         num_tokens_list = [torch.empty_like(num_tokens_tensor, device=query.device) for _ in range(dist.get_world_size())]
-        print(num_tokens_list)
-        print(num_tokens_tensor)
         dist.all_gather(num_tokens_list, num_tokens_tensor)
-        print(num_tokens_list)
-        exit()
         num_tokens_list = [t.item() for t in num_tokens_list]
 
         if is_prompt:
