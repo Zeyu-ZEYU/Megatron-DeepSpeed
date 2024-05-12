@@ -314,8 +314,8 @@ class Attention(torch.nn.Module):
             self.inference_current_sequence_len = 0
 
         # Some consistency check.
-        if inference_max_sequence_len:
-            assert self.inference_current_sequence_len < self.inference_key_memory.size(0)
+        if inference_max_sequence_len is not None:
+            assert self.inference_current_sequence_len <= self.inference_key_memory.size(0)
             assert inference_max_sequence_len == self.inference_key_memory.size(0)
         # This is added for safety. In case inference_max_sequence_len
         # is not provided, make sure there is no potential memory left
