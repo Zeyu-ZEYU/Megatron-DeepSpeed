@@ -163,8 +163,106 @@ class _SeqAllToAll(torch.autograd.Function):
                 for _ in range(dist.get_world_size())
             ]
 
+        # quantize input data
+        if is_first_seq_a2a:
+            if input.size(0) == 0:
+                min = 0
+                step = 0
+                for i in range(seq_world_size):
+                    inp_i = input_list[i]
+                    new_inp = torch.empty(
+                        [inp_i.size(0), inp_i.size(1), inp_i.size(2), inp_i.size(3) // 2],
+                        dtype=torch.uint8,
+                        device=inp_i.device,
+                    )
+                    input_list[i] = new_inp
+            else:
+                max = torch.max(input).item()
+                min = torch.min(input).item()
+                step = (max - min) / 16
+                for i in range(seq_world_size):
+                    inp = input_list[i]
+                    inp = (inp - min + (step / 2)) // step
+                    inp = inp.to(torch.uint8)
+                    h_dim = inp.size(3)
+                    inp1 = inp[:, :, :, : h_dim // 2] << 4
+                    inp2 = inp[:, :, :, h_dim // 2 :]
+                    new_inp = inp1.contiguous() + inp2.contiguous()
+                    input_list[i] = new_inp
+            for i in range(seq_world_size):
+                out_i = output_list[i]
+                new_out = torch.empty(
+                    [out_i.size(0), out_i.size(1), out_i.size(2), out_i.size(3) // 2],
+                    dtype=torch.uint8,
+                    device=out_i.device,
+                )
+                output_list[i] = new_out
+            quan_input_list = [
+                torch.tensor([min, step], dtype=torch.float16, device=input.device) for _ in range(seq_world_size)
+            ]
+            quan_output_list = [torch.tensor([0, 0], dtype=torch.float16, device=input.device) for _ in range(seq_world_size)]
+            dist.all_to_all(quan_output_list, quan_input_list)
+        else:
+            max = torch.max(input).item()
+            min = torch.min(input).item()
+            step = (max - min) / 16
+            for i in range(seq_world_size):
+                inp = input_list[i]
+                inp = (inp - min + (step / 2)) // step
+                inp = inp.to(torch.uint8)
+                hid_dim = inp.size(2)
+                inp1 = inp[:, :, : hid_dim // 2] << 4
+                inp2 = inp[:, :, hid_dim // 2 :]
+                new_inp = inp1.contiguous() + inp2.contiguous()
+                input_list[i] = new_inp
+            for i in range(seq_world_size):
+                out_i = output_list[i]
+                new_out = torch.empty(
+                    [out_i.size(0), out_i.size(1), out_i.size(2) // 2],
+                    dtype=torch.uint8,
+                    device=out_i.device,
+                )
+                output_list[i] = new_out
+            quan_input_list = [
+                torch.tensor([min, step], dtype=torch.float16, device=input.device) for _ in range(seq_world_size)
+            ]
+            quan_output_list = [torch.tensor([0, 0], dtype=torch.float16, device=input.device) for _ in range(seq_world_size)]
+            dist.all_to_all(quan_output_list, quan_input_list)
+
         # TODO Use all_to_all_single instead
         dist.all_to_all(output_list, input_list)
+
+        # dequantize
+        if is_first_seq_a2a:
+            for i in range(seq_world_size):
+                quan_out = output_list[i]
+                if quan_out.size(0) == 0:
+                    dequan_out = torch.empty(
+                        [quan_out.size(0), quan_out.size(1), quan_out.size(2), quan_out.size(3) * 2],
+                        dtype=torch.float16,
+                        device=quan_out.device,
+                    )
+                    output_list[i] = dequan_out
+                else:
+                    dequan_out_1 = quan_out >> 4
+                    dequan_out_2 = quan_out << 4 >> 4
+                    dequan_out = torch.cat([dequan_out_1, dequan_out_2], dim=3).contiguous().to(torch.float16)
+                    output_list[i] = dequan_out * quan_output_list[i][1] + quan_output_list[i][0]
+        else:
+            for i in range(seq_world_size):
+                quan_out = output_list[i]
+                if quan_out.size(0) == 0:
+                    dequan_out = torch.empty(
+                        [quan_out.size(0), quan_out.size(1), quan_out.size(3) * 2],
+                        dtype=torch.float16,
+                        device=quan_out.device,
+                    )
+                    output_list[i] = dequan_out
+                else:
+                    dequan_out_1 = quan_out >> 4
+                    dequan_out_2 = quan_out << 4 >> 4
+                    dequan_out = torch.cat([dequan_out_1, dequan_out_2], dim=2).contiguous().to(torch.float16)
+                    output_list[i] = dequan_out * quan_output_list[i][1] + quan_output_list[i][0]
 
         return torch.cat(output_list, dim=gather_idx).contiguous()
 
@@ -231,6 +329,8 @@ class _DistributedAttention(torch.nn.Module):
         context_layer = self.core_attn(query_layer, key_layer, value_layer)
 
         output = _SeqAllToAll.apply(context_layer, self.gather_idx, self.scatter_idx, num_tokens_list, False)
+
+        exit()
 
         # out e.g., [s/p::h]
         return output
