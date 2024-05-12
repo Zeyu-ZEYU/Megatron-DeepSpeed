@@ -304,7 +304,7 @@ class Attention(torch.nn.Module):
         # Pre-allocate memory for key-values for inference.
         # =================================================
         if set_inference_key_value_memory:
-            assert inference_max_sequence_len and inference_max_sequence_len > 0
+            assert inference_max_sequence_len is not None and inference_max_sequence_len >= 0
             self.inference_key_memory = self._allocate_memory(
                 inference_max_sequence_len, hidden_states.size(1), hidden_states.dtype, hidden_states.device
             )
