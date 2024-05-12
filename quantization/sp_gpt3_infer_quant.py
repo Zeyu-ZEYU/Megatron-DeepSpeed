@@ -28,7 +28,7 @@ MASTER_DIST_PORT = 43214
 MASTER_SERVER_PORT = 43211
 NODE_SERVER_PORT = 34119
 CODE_NAME_FOR_SHELL = "sp_gpt3_infer.py"
-CODE_PATH_FOR_SHELL = "/home/hshen/zeyu/Megatron-DeepSpeed/sp_infer"
+CODE_PATH_FOR_SHELL = "/home/hshen/zeyu/Megatron-DeepSpeed/quantization"
 
 
 # Inference config
