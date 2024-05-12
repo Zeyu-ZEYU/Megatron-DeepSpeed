@@ -211,6 +211,8 @@ class _DistributedAttention(torch.nn.Module):
         print(num_tokens_list)
         print(num_tokens_tensor)
         dist.all_gather(num_tokens_list, num_tokens_tensor)
+        print(num_tokens_list)
+        exit()
         num_tokens_list = [t.item() for t in num_tokens_list]
 
         if is_prompt:
@@ -468,8 +470,7 @@ class TransformerLayer(torch.nn.Module):
         self.bias_dropout_add_exec_handler = nullcontext if use_nvfuser else torch.enable_grad
 
     def forward(self, hidden_states, set_inference_key_value_memory=False, inference_max_sequence_len=None):
-        with torch.autocast(device_type="cuda", dtype=torch.float16):
-            layernorm_output = self.input_layernorm(hidden_states)
+        layernorm_output = self.input_layernorm(hidden_states)
         attention_output, attention_bias = self.self_attention(
             layernorm_output, set_inference_key_value_memory, inference_max_sequence_len
         )
@@ -479,8 +480,7 @@ class TransformerLayer(torch.nn.Module):
             attention_bias = attention_bias.expand_as(residual)
         with self.bias_dropout_add_exec_handler():
             layernorm_input = bias_dropout_add_func(attention_output, attention_bias, residual, self.hidden_dropout)
-        with torch.autocast(device_type="cuda", dtype=torch.float16):
-            layernorm_output = self.post_attention_layernorm(layernorm_input)
+        layernorm_output = self.post_attention_layernorm(layernorm_input)
 
         # MLP.
         mlp_bias = torch.tensor(0.0, device=layernorm_output.device, dtype=layernorm_output.dtype)
@@ -551,8 +551,7 @@ class Transformer(torch.nn.Module):
         for ly in range(NUM_LAYERS):
             hidden_states = custom(ly, ly + 1)(hidden_states, set_inference_key_value_memory, inference_max_sequence_len)
 
-        with torch.autocast(device_type="cuda", dtype=torch.float16):
-            hidden_states = self.final_layernorm(hidden_states)
+        hidden_states = self.final_layernorm(hidden_states)
 
         return hidden_states
 
@@ -646,6 +645,8 @@ class GPTModel(torch.nn.Module):
 
         self.embedding = Embedding()
         self.encoder = Transformer()
+
+        self.half()
 
         if param_pickle_path:
             self._init_model(param_pickle_path)
