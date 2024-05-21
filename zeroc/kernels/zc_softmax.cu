@@ -22,15 +22,13 @@ __global__ void softmax_kernel(float *input, float *output, int rows, int cols)
     float sum_exp = 0;
     for (int j = 0; j < cols; ++j)
     {
-        float temp = exp(input[row_start + j] - max_val);
-        output[row_start + j] = temp;
-        sum_exp += temp;
+        sum_exp += exp(input[row_start + j] - max_val);
     }
 
     // Step 3: Compute the softmax output
     for (int j = 0; j < cols; ++j)
     {
-        output[row_start + j] = output[row_start + j] / sum_exp;
+        output[row_start + j] = exp(input[row_start + j] - max_val) / sum_exp;
     }
 }
 
