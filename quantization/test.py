@@ -1,14 +1,23 @@
+# import torch
+
+# table = torch.tensor([10, 39, 18, 23], dtype=torch.float, device="cuda:0")
+
+# compressed = torch.tensor([[0, 1, 2, 1, 1, 1], [3, 3, 3, 3, 3, 1]], dtype=torch.uint8, device=table.device)
+
+# a = table[compressed]
+
+# print(a)
+
 import torch
 
-device = torch.device("cuda")
-t1 = torch.tensor([1, 2, 3, 4], device=device, dtype=torch.uint8)
-t2 = torch.tensor([5, 6, 7, 8], device=device, dtype=torch.uint8)
+# Define the mapping
+mapping_tensor = torch.rand(16, dtype=torch.float16)  # Random float16 values
 
-t1 = t1 << 4
-new = t1 + t2
-new
-t1 = new >> 4
-t2 = new << 4 >> 4
-print(t1, t2)
-input = "How big is the universe? " * 500
-print(len(input))
+# Move the tensor to GPU
+mapping_tensor = mapping_tensor.cuda()
+
+# Lookup example using torch.uint8 for indices
+indices = torch.tensor([0, 5, 14, 2], dtype=torch.int)  # Use uint8 for indices
+lookup_values = mapping_tensor[indices.cuda()]  # Perform lookup
+
+print("Lookup Results:", lookup_values)

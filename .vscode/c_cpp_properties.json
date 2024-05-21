@@ -1,0 +1,29 @@
+// .vscode/c_cpp_properties.json
+{
+    "configurations": [
+        {
+            "name": "Linux",
+            "includePath": [
+                "${workspaceFolder}/**",
+                "/home/hshen/zeyu/cuda_11.8/include",
+                "/home/hshen/anaconda3/envs/gpt3/include/python3.10",
+                "/home/hshen/anaconda3/envs/gpt3/lib/python3.10/site-packages/torch/include/torch/csrc/api/include",
+                "/home/hshen/anaconda3/envs/gpt3/lib/python3.10/site-packages/torch/include"
+            ],
+            "defines": [],
+            "compilerPath": "/usr/bin/gcc",
+            "cStandard": "c11",
+            "cppStandard": "c++17",
+            "intelliSenseMode": "linux-gcc-x64",
+            "browse": {
+                "path": [
+                    "${workspaceFolder}/**",
+                    "/home/hshen/zeyu/cuda_11.8/include"
+                ],
+                "limitSymbolsToIncludedHeaders": true,
+                "databaseFilename": ""
+            }
+        }
+    ],
+    "version": 4
+}

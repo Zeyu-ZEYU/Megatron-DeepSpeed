@@ -1,0 +1,23 @@
+// .vscode/tasks.json
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "build",
+            "type": "shell",
+            "command": "/home/hshen/zeyu/cuda_11.8/bin/nvcc",
+            "args": [
+                "-o",
+                "${workspaceFolder}/zeroc/kernels/build/softmax",
+                "${workspaceFolder}/zeroc/kernels/softmax.cu"
+            ],
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "problemMatcher": [
+                "$gcc"
+            ]
+        }
+    ]
+}
