@@ -156,10 +156,6 @@ if __name__ == "__main__":
 
     data = _init_data()
 
-    torch.cuda.synchronize()
-    t1 = time.time()
-    for _ in range(NUM_LAYERS):
-        _run_layer()
-    torch.cuda.synchronize()
-    t2 = time.time()
-    print(1000 * (t2 - t1))
+    with _Timer("end_to_end_time"):
+        for _ in range(NUM_LAYERS):
+            _run_layer()
