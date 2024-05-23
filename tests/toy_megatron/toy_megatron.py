@@ -10,7 +10,7 @@ import torch.distributed as dist
 from einops import rearrange
 from flash_attn.flash_attn_interface import flash_attn_varlen_func
 
-RANK_0_IP = "192.168.0.2"
+RANK_0_IP = "192.168.0.3"
 RANK_0_PORT = 31187
 
 
@@ -54,6 +54,12 @@ class _Timer:
         print(f"{self.name}: {self.interval}ms out of {self.total_time}ms.")
 
 
+def _pause(ms):
+    torch.cuda.synchronize()
+    time.sleep(ms / 1000)
+    torch.cuda.synchronize()
+
+
 def _init_data():
     data = {}
     data["seq_embed"] = torch.rand([BATCH_SIZE, PART_SEQ_LEN, MODEL_DIM], dtype=torch.float16, device="cuda:0")
@@ -78,50 +84,53 @@ def _run_layer():
     f_dropout = data["f_dropout"]
     f_gelu = data["f_gelu"]
 
-    seq_embed = f_layernorm(seq_embed)
+    with _Timer("layernorm_dropout"):
+        seq_embed = f_layernorm(seq_embed)
 
     with _Timer("attn_all_gather"):
         seq_embed_list = [torch.empty_like(seq_embed, dtype=torch.float16, device="cuda:0") for _ in range(args.world_size)]
         dist.all_gather(seq_embed_list, seq_embed)
         seq_embed = torch.concat(seq_embed_list, dim=1)
 
-    qkv = torch.matmul(seq_embed, p_qkv_gen)
-    PART_DIM = NUM_HEADS_PER_PART * HEAD_DIM
-    q = qkv[..., :PART_DIM]
-    k = qkv[..., PART_DIM : 2 * PART_DIM]
-    v = qkv[..., 2 * PART_DIM :]
-    q_len = q.size(1)
-    k_len = k.size(1)
-    q = rearrange(q, "b s (h d) -> (b s) h d", h=NUM_HEADS_PER_PART)
-    k = rearrange(k, "b s (h d) -> (b s) h d", h=NUM_HEADS_PER_PART)
-    v = rearrange(v, "b s (h d) -> (b s) h d", h=NUM_HEADS_PER_PART)
+    with _Timer("attn"):
+        qkv = torch.matmul(seq_embed, p_qkv_gen)
+        PART_DIM = NUM_HEADS_PER_PART * HEAD_DIM
+        q = qkv[..., :PART_DIM]
+        k = qkv[..., PART_DIM : 2 * PART_DIM]
+        v = qkv[..., 2 * PART_DIM :]
+        q_len = q.size(1)
+        k_len = k.size(1)
+        q = rearrange(q, "b s (h d) -> (b s) h d", h=NUM_HEADS_PER_PART)
+        k = rearrange(k, "b s (h d) -> (b s) h d", h=NUM_HEADS_PER_PART)
+        v = rearrange(v, "b s (h d) -> (b s) h d", h=NUM_HEADS_PER_PART)
 
-    # attn
-    cu_seqlens_q = torch.arange(0, (BATCH_SIZE + 1) * q_len, step=q_len, dtype=torch.int32, device="cuda:0")
-    cu_seqlens_k = torch.arange(0, (BATCH_SIZE + 1) * k_len, step=k_len, dtype=torch.int32, device="cuda:0")
-    attn_output = flash_attn_varlen_func(
-        q,
-        k,
-        v,
-        cu_seqlens_q,
-        cu_seqlens_k,
-        q_len,
-        k_len,
-        0.1,
-        causal=True,
-    )
+        # attn
+        cu_seqlens_q = torch.arange(0, (BATCH_SIZE + 1) * q_len, step=q_len, dtype=torch.int32, device="cuda:0")
+        cu_seqlens_k = torch.arange(0, (BATCH_SIZE + 1) * k_len, step=k_len, dtype=torch.int32, device="cuda:0")
+        attn_output = flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            q_len,
+            k_len,
+            0.1,
+            causal=True,
+        )
 
-    attn_output = rearrange(attn_output, "(b s) h d -> b s (h d)", b=BATCH_SIZE)
-    output = torch.matmul(attn_output, p_attn_linear)
+        attn_output = rearrange(attn_output, "(b s) h d -> b s (h d)", b=BATCH_SIZE)
+        output = torch.matmul(attn_output, p_attn_linear)
 
     with _Timer("attn_reduce_scatter"):
         rs_inputs = list(torch.tensor_split(output, args.world_size, dim=1))
         rs_output = torch.empty_like(rs_inputs[0], dtype=torch.float16, device="cuda:0")
         dist.reduce_scatter(rs_output, rs_inputs)
 
-    seq_embed = f_dropout(rs_output)
+    with _Timer("layernorm_dropout"):
+        seq_embed = f_dropout(rs_output)
 
-    seq_embed = f_layernorm(seq_embed)
+        seq_embed = f_layernorm(seq_embed)
 
     # MLP
     with _Timer("mlp_all_gather"):
@@ -129,16 +138,18 @@ def _run_layer():
         dist.all_gather(seq_embed_list, seq_embed)
         seq_embed = torch.concat(seq_embed_list, dim=1)
 
-    mlp_1_output = torch.matmul(seq_embed, p_mlp_1)
-    gelu_result = f_gelu(mlp_1_output)
-    mlp_2_output = torch.matmul(gelu_result, p_mlp_2)
+    with _Timer("mlp"):
+        mlp_1_output = torch.matmul(seq_embed, p_mlp_1)
+        gelu_result = f_gelu(mlp_1_output)
+        mlp_2_output = torch.matmul(gelu_result, p_mlp_2)
 
     with _Timer("mlp_reduce_scatter"):
         rs_inputs = list(torch.tensor_split(mlp_2_output, args.world_size, dim=1))
         rs_output = torch.empty_like(rs_inputs[0], dtype=torch.float16, device="cuda:0")
         dist.reduce_scatter(rs_output, rs_inputs)
 
-    seq_embed = f_dropout(rs_output)
+    with _Timer("layernorm_dropout"):
+        seq_embed = f_dropout(rs_output)
 
 
 if __name__ == "__main__":
@@ -156,6 +167,7 @@ if __name__ == "__main__":
 
     data = _init_data()
 
+    dist.barrier()
     with _Timer("end_to_end_time"):
         for _ in range(NUM_LAYERS):
             _run_layer()
