@@ -1,3 +1,6 @@
+#!/usr/bin/env python3
+
+
 import time
 
 import torch
@@ -44,13 +47,23 @@ for _ in range(10):
         result = result / 2
 
     with Timer("softmax"):
-        result = sm(result)
+        prob = sm(result)
 
-    with Timer("decompress v"):
-        v = (quant_v * scaling + min).to(torch.float16)
+    # with Timer("decompress v"):
+    #     v = (quant_v * scaling + min).to(torch.float16)
 
-    with Timer("transpose"):
-        v.transpose(1, 2)
+    with Timer("v convert_to_fp16"):
+        quant_v_ = quant_v.to(torch.float16)
+    with Timer("quant v matmul"):
+        r = torch.bmm(prob, quant_v_)
 
-    with Timer("v"):
-        result = torch.bmm(result, v)
+    with Timer("v recover"):
+        result = r * scaling + torch.sum(prob, dim=2, keepdim=True) * min
+
+    print(result.shape)
+
+    # with Timer("transpose"):
+    #     v.transpose(1, 2)
+
+    # with Timer("v"):
+    #     result = torch.bmm(result, v)
