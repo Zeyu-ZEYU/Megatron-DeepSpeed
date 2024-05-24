@@ -5,10 +5,10 @@
             "name": "Linux",
             "includePath": [
                 "${workspaceFolder}/**",
-                "/home/hshen/zeyu/cuda_11.8/include",
-                "/home/hshen/anaconda3/envs/gpt3/include/python3.10",
-                "/home/hshen/anaconda3/envs/gpt3/lib/python3.10/site-packages/torch/include/torch/csrc/api/include",
-                "/home/hshen/anaconda3/envs/gpt3/lib/python3.10/site-packages/torch/include"
+                "/home/zeyu/cuda/include",
+                "/home/zeyu/anaconda3/envs/zeyu/include/python3.12",
+                "/home/zeyu/anaconda3/envs/zeyu/lib/python3.12/site-packages/torch/include/torch/csrc/api/include",
+                "/home/zeyu/anaconda3/envs/zeyu/lib/python3.12/site-packages/torch/include"
             ],
             "defines": [],
             "compilerPath": "/usr/bin/gcc",
@@ -18,7 +18,7 @@
             "browse": {
                 "path": [
                     "${workspaceFolder}/**",
-                    "/home/hshen/zeyu/cuda_11.8/include"
+                    "/home/zeyu/cuda/include"
                 ],
                 "limitSymbolsToIncludedHeaders": true,
                 "databaseFilename": ""

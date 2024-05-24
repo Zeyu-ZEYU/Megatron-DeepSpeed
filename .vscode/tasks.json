@@ -5,7 +5,7 @@
         {
             "label": "build",
             "type": "shell",
-            "command": "/home/hshen/zeyu/cuda_11.8/bin/nvcc",
+            "command": "/home/zeyu/cuda/bin/nvcc",
             "args": [
                 "-o",
                 "${workspaceFolder}/zeroc/kernels/build/softmax",

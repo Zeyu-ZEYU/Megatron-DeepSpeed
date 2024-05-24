@@ -10,7 +10,7 @@ import torch.distributed as dist
 from einops import rearrange
 from flash_attn.flash_attn_interface import flash_attn_varlen_func
 
-RANK_0_IP = "192.168.0.3"
+RANK_0_IP = "192.168.0.2"
 RANK_0_PORT = 31187
 
 
@@ -67,6 +67,9 @@ def _init_data():
     data["p_attn_linear"] = torch.rand([MODEL_DIM // args.world_size, MODEL_DIM], dtype=torch.float16, device="cuda:0")
     data["p_mlp_1"] = torch.rand([MODEL_DIM, 4 * MODEL_DIM // args.world_size], dtype=torch.float16, device="cuda:0")
     data["p_mlp_2"] = torch.rand([4 * MODEL_DIM // args.world_size, MODEL_DIM], dtype=torch.float16, device="cuda:0")
+    data["f_attn"] = (
+        torch.nn.MultiheadAttention(MODEL_DIM, NUM_HEADS_PER_PART, 0.1, batch_first=True).to(torch.float16).to("cuda:0")
+    )
     data["f_layernorm"] = torch.nn.LayerNorm(MODEL_DIM).to(torch.float16).to("cuda:0")
     data["f_dropout"] = torch.nn.Dropout(0.1)
     data["f_gelu"] = torch.nn.GELU()
@@ -80,6 +83,7 @@ def _run_layer():
     p_attn_linear = data["p_attn_linear"]
     p_mlp_1 = data["p_mlp_1"]
     p_mlp_2 = data["p_mlp_2"]
+    f_attn = data["f_attn"]
     f_layernorm = data["f_layernorm"]
     f_dropout = data["f_dropout"]
     f_gelu = data["f_gelu"]
@@ -98,28 +102,30 @@ def _run_layer():
         q = qkv[..., :PART_DIM]
         k = qkv[..., PART_DIM : 2 * PART_DIM]
         v = qkv[..., 2 * PART_DIM :]
-        q_len = q.size(1)
-        k_len = k.size(1)
-        q = rearrange(q, "b s (h d) -> (b s) h d", h=NUM_HEADS_PER_PART)
-        k = rearrange(k, "b s (h d) -> (b s) h d", h=NUM_HEADS_PER_PART)
-        v = rearrange(v, "b s (h d) -> (b s) h d", h=NUM_HEADS_PER_PART)
 
-        # attn
-        cu_seqlens_q = torch.arange(0, (BATCH_SIZE + 1) * q_len, step=q_len, dtype=torch.int32, device="cuda:0")
-        cu_seqlens_k = torch.arange(0, (BATCH_SIZE + 1) * k_len, step=k_len, dtype=torch.int32, device="cuda:0")
-        attn_output = flash_attn_varlen_func(
-            q,
-            k,
-            v,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            q_len,
-            k_len,
-            0.1,
-            causal=True,
-        )
+        # q_len = q.size(1)
+        # k_len = k.size(1)
+        # q = rearrange(q, "b s (h d) -> (b s) h d", h=NUM_HEADS_PER_PART)
+        # k = rearrange(k, "b s (h d) -> (b s) h d", h=NUM_HEADS_PER_PART)
+        # v = rearrange(v, "b s (h d) -> (b s) h d", h=NUM_HEADS_PER_PART)
 
-        attn_output = rearrange(attn_output, "(b s) h d -> b s (h d)", b=BATCH_SIZE)
+        # # attn
+        # cu_seqlens_q = torch.arange(0, (BATCH_SIZE + 1) * q_len, step=q_len, dtype=torch.int32, device="cuda:0")
+        # cu_seqlens_k = torch.arange(0, (BATCH_SIZE + 1) * k_len, step=k_len, dtype=torch.int32, device="cuda:0")
+        # attn_output = flash_attn_varlen_func(
+        #     q,
+        #     k,
+        #     v,
+        #     cu_seqlens_q,
+        #     cu_seqlens_k,
+        #     q_len,
+        #     k_len,
+        #     0.1,
+        #     causal=True,
+        # )
+        attn_output, _ = f_attn(q, k, v)
+
+        # attn_output = rearrange(attn_output, "(b s) h d -> b s (h d)", b=BATCH_SIZE)
         output = torch.matmul(attn_output, p_attn_linear)
 
     with _Timer("attn_reduce_scatter"):
