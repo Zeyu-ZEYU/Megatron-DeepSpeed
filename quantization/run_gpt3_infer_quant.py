@@ -233,6 +233,6 @@ def gpt_generate(inputs: List[str], max_gen_len):
 
 
 if __name__ == "__main__":
-    inputs = ["how " * 2000 for _ in range(30)]
-    resp_sentences, resp_sentences_seg = gpt_generate(inputs, 3)
+    inputs = ["how " * 2000]
+    resp_sentences, resp_sentences_seg = gpt_generate(inputs, 2)
     # print(resp_sentences)

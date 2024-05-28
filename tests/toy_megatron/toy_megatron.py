@@ -7,10 +7,13 @@ import time
 
 import torch
 import torch.distributed as dist
-from einops import rearrange
-from flash_attn.flash_attn_interface import flash_attn_varlen_func
+from torch.profiler import ProfilerActivity, profile, record_function
 
-RANK_0_IP = "192.168.0.2"
+# from einops import rearrange
+# from flash_attn.flash_attn_interface import flash_attn_varlen_func
+
+
+RANK_0_IP = "192.168.0.3"
 RANK_0_PORT = 31187
 
 
@@ -22,7 +25,7 @@ MODEL_DIM = 7680
 NUM_HEADS = 60
 assert MODEL_DIM % NUM_HEADS == 0
 HEAD_DIM = MODEL_DIM // NUM_HEADS
-NUM_LAYERS = 60
+NUM_LAYERS = 10
 
 
 def _singleton_timer(cls):
@@ -43,21 +46,81 @@ class _Timer:
         self.total_time = 0
 
     def __enter__(self):
-        torch.cuda.synchronize()
-        self.start = time.time()
+        # torch.cuda.synchronize()
+        # self.start = time.time()
         return self
 
     def __exit__(self, *args):
-        torch.cuda.synchronize()
-        self.interval = 1000 * (time.time() - self.start)
-        self.total_time += self.interval
-        print(f"{self.name}: {self.interval}ms out of {self.total_time}ms.")
+        # torch.cuda.synchronize()
+        # self.interval = 1000 * (time.time() - self.start)
+        # self.total_time += self.interval
+        # print(f"{self.name}: {self.interval}ms out of {self.total_time}ms.")
+        pass
 
 
 def _pause(ms):
     torch.cuda.synchronize()
     time.sleep(ms / 1000)
     torch.cuda.synchronize()
+
+
+def _all_gather(outputs, input):
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    reqs = []
+
+    for i in range(world_size):
+        if i != rank:
+            if i > rank:
+                reqs.append(dist.isend(input, dst=i))
+            else:
+                reqs.append(dist.irecv(outputs[i], src=i))
+        else:
+            outputs[i] = input
+
+    for i in range(world_size):
+        if i != rank:
+            if i > rank:
+                reqs.append(dist.irecv(outputs[i], src=i))
+            else:
+                reqs.append(dist.isend(input, dst=i))
+
+    for req in reqs:
+        req.wait()
+
+    return outputs
+
+
+def _reduce_scatter(output, inputs):
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    output = torch.zeros_like(output)
+    recv_tensors = [torch.empty_like(inputs[rank]) for _ in range(world_size)]
+    reqs = []
+
+    for i in range(world_size):
+        if i != rank:
+            if i > rank:
+                reqs.append(dist.isend(inputs[i], dst=i))
+            else:
+                reqs.append(dist.irecv(recv_tensors[i], src=i))
+        else:
+            recv_tensors[i] = inputs[i]
+
+    for i in range(world_size):
+        if i != rank:
+            if i > rank:
+                reqs.append(dist.irecv(recv_tensors[i], src=i))
+            else:
+                reqs.append(dist.isend(inputs[i], dst=i))
+
+    for req in reqs:
+        req.wait()
+
+    for tsr in recv_tensors:
+        output += tsr
+
+    return output
 
 
 def _init_data():
@@ -68,7 +131,9 @@ def _init_data():
     data["p_mlp_1"] = torch.rand([MODEL_DIM, 4 * MODEL_DIM // args.world_size], dtype=torch.float16, device="cuda:0")
     data["p_mlp_2"] = torch.rand([4 * MODEL_DIM // args.world_size, MODEL_DIM], dtype=torch.float16, device="cuda:0")
     data["f_attn"] = (
-        torch.nn.MultiheadAttention(MODEL_DIM, NUM_HEADS_PER_PART, 0.1, batch_first=True).to(torch.float16).to("cuda:0")
+        torch.nn.MultiheadAttention(MODEL_DIM // args.world_size, NUM_HEADS_PER_PART, 0.1, batch_first=True)
+        .to(torch.float16)
+        .to("cuda:0")
     )
     data["f_layernorm"] = torch.nn.LayerNorm(MODEL_DIM).to(torch.float16).to("cuda:0")
     data["f_dropout"] = torch.nn.Dropout(0.1)
@@ -93,7 +158,7 @@ def _run_layer():
 
     with _Timer("attn_all_gather"):
         seq_embed_list = [torch.empty_like(seq_embed, dtype=torch.float16, device="cuda:0") for _ in range(args.world_size)]
-        dist.all_gather(seq_embed_list, seq_embed)
+        _all_gather(seq_embed_list, seq_embed)
         seq_embed = torch.concat(seq_embed_list, dim=1)
 
     with _Timer("attn"):
@@ -131,7 +196,7 @@ def _run_layer():
     with _Timer("attn_reduce_scatter"):
         rs_inputs = list(torch.tensor_split(output, args.world_size, dim=1))
         rs_output = torch.empty_like(rs_inputs[0], dtype=torch.float16, device="cuda:0")
-        dist.reduce_scatter(rs_output, rs_inputs)
+        _reduce_scatter(rs_output, rs_inputs)
 
     with _Timer("layernorm_dropout"):
         seq_embed = f_dropout(rs_output)
@@ -141,7 +206,7 @@ def _run_layer():
     # MLP
     with _Timer("mlp_all_gather"):
         seq_embed_list = [torch.empty_like(seq_embed, dtype=torch.float16, device="cuda:0") for _ in range(args.world_size)]
-        dist.all_gather(seq_embed_list, seq_embed)
+        _all_gather(seq_embed_list, seq_embed)
         seq_embed = torch.concat(seq_embed_list, dim=1)
 
     with _Timer("mlp"):
@@ -152,7 +217,7 @@ def _run_layer():
     with _Timer("mlp_reduce_scatter"):
         rs_inputs = list(torch.tensor_split(mlp_2_output, args.world_size, dim=1))
         rs_output = torch.empty_like(rs_inputs[0], dtype=torch.float16, device="cuda:0")
-        dist.reduce_scatter(rs_output, rs_inputs)
+        _reduce_scatter(rs_output, rs_inputs)
 
     with _Timer("layernorm_dropout"):
         seq_embed = f_dropout(rs_output)
@@ -175,5 +240,15 @@ if __name__ == "__main__":
 
     dist.barrier()
     with _Timer("end_to_end_time"):
-        for _ in range(NUM_LAYERS):
-            _run_layer()
+
+        def trace_handler(p):
+            p.export_chrome_trace("trace.json")
+
+        with profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+            schedule=torch.profiler.schedule(wait=0, warmup=1, active=NUM_LAYERS - 1),
+            on_trace_ready=trace_handler,
+        ) as p:
+            for _ in range(NUM_LAYERS):
+                _run_layer()
+                p.step()
