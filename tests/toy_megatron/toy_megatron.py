@@ -28,6 +28,15 @@ HEAD_DIM = MODEL_DIM // NUM_HEADS
 NUM_LAYERS = 10
 
 
+# send_stream = torch.cuda.Stream()
+# recv_stream = torch.cuda.Stream()
+compute_stream = torch.cuda.Stream()
+
+
+# recv_complete_event = None
+compute_complete_event = None
+
+
 def _singleton_timer(cls):
     timers = {}
 
@@ -67,26 +76,35 @@ def _pause(ms):
 def _all_gather(outputs, input):
     rank = dist.get_rank()
     world_size = dist.get_world_size()
-    reqs = []
+    handles = []
 
     for i in range(world_size):
         if i != rank:
             if i > rank:
-                reqs.append(dist.isend(input, dst=i))
+                # with torch.cuda.stream(send_stream):
+                dist.isend(input, dst=i, group=first_comm_group)
             else:
-                reqs.append(dist.irecv(outputs[i], src=i))
+                # with torch.cuda.stream(recv_stream):
+                handles.append(dist.irecv(outputs[i], src=i, group=first_comm_group))
         else:
             outputs[i] = input
 
     for i in range(world_size):
         if i != rank:
             if i > rank:
-                reqs.append(dist.irecv(outputs[i], src=i))
+                # with torch.cuda.stream(recv_stream):
+                handles.append(dist.irecv(outputs[i], src=i, group=second_comm_group))
             else:
-                reqs.append(dist.isend(input, dst=i))
+                # with torch.cuda.stream(send_stream):
+                dist.isend(input, dst=i, group=second_comm_group)
 
-    for req in reqs:
-        req.wait()
+    # global recv_complete_event
+    # recv_complete_event = torch.cuda.Event()
+    # recv_complete_event.record(stream=recv_stream)
+    # recv_complete_event.wait()
+
+    for handle in handles:
+        handle.wait()
 
     return outputs
 
@@ -96,26 +114,35 @@ def _reduce_scatter(output, inputs):
     world_size = dist.get_world_size()
     output = torch.zeros_like(output)
     recv_tensors = [torch.empty_like(inputs[rank]) for _ in range(world_size)]
-    reqs = []
+    handles = []
 
     for i in range(world_size):
         if i != rank:
             if i > rank:
-                reqs.append(dist.isend(inputs[i], dst=i))
+                # with torch.cuda.stream(send_stream):
+                dist.isend(inputs[i], dst=i, group=first_comm_group)
             else:
-                reqs.append(dist.irecv(recv_tensors[i], src=i))
+                # with torch.cuda.stream(recv_stream):
+                handles.append(dist.irecv(recv_tensors[i], src=i, group=first_comm_group))
         else:
             recv_tensors[i] = inputs[i]
 
     for i in range(world_size):
         if i != rank:
             if i > rank:
-                reqs.append(dist.irecv(recv_tensors[i], src=i))
+                # with torch.cuda.stream(recv_stream):
+                handles.append(dist.irecv(recv_tensors[i], src=i, group=second_comm_group))
             else:
-                reqs.append(dist.isend(inputs[i], dst=i))
+                # with torch.cuda.stream(send_stream):
+                dist.isend(inputs[i], dst=i, group=second_comm_group)
 
-    for req in reqs:
-        req.wait()
+    for handle in handles:
+        handle.wait()
+
+    # global recv_complete_event
+    # recv_complete_event = torch.cuda.Event()
+    # recv_complete_event.record(stream=recv_stream)
+    # recv_complete_event.wait()
 
     for tsr in recv_tensors:
         output += tsr
@@ -235,6 +262,9 @@ if __name__ == "__main__":
 
     os.environ["CUDA_VISIBLE_DEVICES"] = f"{args.gpu_id}"
     dist.init_process_group("nccl", init_method=f"tcp://{RANK_0_IP}:{RANK_0_PORT}", rank=args.rank, world_size=args.world_size)
+
+    first_comm_group = dist.new_group(backend="nccl")
+    second_comm_group = dist.new_group(backend="nccl")
 
     data = _init_data()
 
