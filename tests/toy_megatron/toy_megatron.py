@@ -37,6 +37,9 @@ compute_stream = torch.cuda.Stream()
 compute_complete_event = None
 
 
+send_handles = []
+
+
 def _singleton_timer(cls):
     timers = {}
 
@@ -77,12 +80,14 @@ def _all_gather(outputs, input):
     rank = dist.get_rank()
     world_size = dist.get_world_size()
     handles = []
+    global send_handles
+    send_handles = []
 
     for i in range(world_size):
         if i != rank:
             if i > rank:
                 # with torch.cuda.stream(send_stream):
-                dist.isend(input, dst=i, group=first_comm_group)
+                send_handles.append(dist.isend(input, dst=i, group=first_comm_group))
             else:
                 # with torch.cuda.stream(recv_stream):
                 handles.append(dist.irecv(outputs[i], src=i, group=first_comm_group))
@@ -96,7 +101,7 @@ def _all_gather(outputs, input):
                 handles.append(dist.irecv(outputs[i], src=i, group=second_comm_group))
             else:
                 # with torch.cuda.stream(send_stream):
-                dist.isend(input, dst=i, group=second_comm_group)
+                send_handles.append(dist.isend(input, dst=i, group=second_comm_group))
 
     # global recv_complete_event
     # recv_complete_event = torch.cuda.Event()
@@ -120,7 +125,7 @@ def _reduce_scatter(output, inputs):
         if i != rank:
             if i > rank:
                 # with torch.cuda.stream(send_stream):
-                dist.isend(inputs[i], dst=i, group=first_comm_group)
+                send_handles.append(dist.isend(inputs[i], dst=i, group=first_comm_group))
             else:
                 # with torch.cuda.stream(recv_stream):
                 handles.append(dist.irecv(recv_tensors[i], src=i, group=first_comm_group))
@@ -134,7 +139,7 @@ def _reduce_scatter(output, inputs):
                 handles.append(dist.irecv(recv_tensors[i], src=i, group=second_comm_group))
             else:
                 # with torch.cuda.stream(send_stream):
-                dist.isend(inputs[i], dst=i, group=second_comm_group)
+                send_handles.append(dist.isend(inputs[i], dst=i, group=second_comm_group))
 
     for handle in handles:
         handle.wait()
@@ -279,6 +284,10 @@ if __name__ == "__main__":
             schedule=torch.profiler.schedule(wait=0, warmup=1, active=NUM_LAYERS - 1),
             on_trace_ready=trace_handler,
         ) as p:
-            for _ in range(NUM_LAYERS):
+            for ly in range(NUM_LAYERS):
+                if ly == NUM_LAYERS - 5:
+                    for handle in send_handles:
+                        handle.wait()
+                    dist.barrier()
                 _run_layer()
                 p.step()
