@@ -2,18 +2,21 @@
 
 
 import argparse
+import logging
 import os
 import time
 
+import psutil
 import torch
 import torch.distributed as dist
+import torch.multiprocessing as mp
 from torch.profiler import ProfilerActivity, profile, record_function
 
 # from einops import rearrange
 # from flash_attn.flash_attn_interface import flash_attn_varlen_func
 
 
-RANK_0_IP = "192.168.0.3"
+RANK_0_IP = "10.155.48.77"
 RANK_0_PORT = 31187
 
 
@@ -21,11 +24,11 @@ BATCH_SIZE = 1
 PART_SEQ_LEN = 2048
 
 
-MODEL_DIM = 7680
+MODEL_DIM = 7680 * 8
 NUM_HEADS = 60
 assert MODEL_DIM % NUM_HEADS == 0
 HEAD_DIM = MODEL_DIM // NUM_HEADS
-NUM_LAYERS = 10
+NUM_LAYERS = 20
 
 
 # send_stream = torch.cuda.Stream()
@@ -38,6 +41,20 @@ compute_complete_event = None
 
 
 send_handles = []
+
+
+class Logger(object):
+    def __init__(self, job_name, file_path, log_level=logging.INFO, mode="w"):
+        self.__logger = logging.getLogger(job_name)
+        self.__logger.setLevel(log_level)
+        self.__fh = logging.FileHandler(filename=file_path, mode=mode)
+        self.__formatter = logging.Formatter("%(asctime)s - %(name)s - %(message)s")
+        self.__fh.setFormatter(self.__formatter)
+        self.__logger.addHandler(self.__fh)
+
+    @property
+    def logger(self):
+        return self.__logger
 
 
 def _singleton_timer(cls):
@@ -63,7 +80,9 @@ class _Timer:
         return self
 
     def __exit__(self, *args):
-        # torch.cuda.synchronize()
+        torch.cuda.synchronize()
+        global logger
+        logger.info(self.name)
         # self.interval = 1000 * (time.time() - self.start)
         # self.total_time += self.interval
         # print(f"{self.name}: {self.interval}ms out of {self.total_time}ms.")
@@ -190,7 +209,7 @@ def _run_layer():
 
     with _Timer("attn_all_gather"):
         seq_embed_list = [torch.empty_like(seq_embed, dtype=torch.float16, device="cuda:0") for _ in range(args.world_size)]
-        _all_gather(seq_embed_list, seq_embed)
+        dist.all_gather(seq_embed_list, seq_embed)
         seq_embed = torch.concat(seq_embed_list, dim=1)
 
     with _Timer("attn"):
@@ -228,7 +247,7 @@ def _run_layer():
     with _Timer("attn_reduce_scatter"):
         rs_inputs = list(torch.tensor_split(output, args.world_size, dim=1))
         rs_output = torch.empty_like(rs_inputs[0], dtype=torch.float16, device="cuda:0")
-        _reduce_scatter(rs_output, rs_inputs)
+        dist.reduce_scatter(rs_output, rs_inputs)
 
     with _Timer("layernorm_dropout"):
         seq_embed = f_dropout(rs_output)
@@ -238,7 +257,7 @@ def _run_layer():
     # MLP
     with _Timer("mlp_all_gather"):
         seq_embed_list = [torch.empty_like(seq_embed, dtype=torch.float16, device="cuda:0") for _ in range(args.world_size)]
-        _all_gather(seq_embed_list, seq_embed)
+        dist.all_gather(seq_embed_list, seq_embed)
         seq_embed = torch.concat(seq_embed_list, dim=1)
 
     with _Timer("mlp"):
@@ -249,7 +268,7 @@ def _run_layer():
     with _Timer("mlp_reduce_scatter"):
         rs_inputs = list(torch.tensor_split(mlp_2_output, args.world_size, dim=1))
         rs_output = torch.empty_like(rs_inputs[0], dtype=torch.float16, device="cuda:0")
-        _reduce_scatter(rs_output, rs_inputs)
+        dist.reduce_scatter(rs_output, rs_inputs)
 
     with _Timer("layernorm_dropout"):
         seq_embed = f_dropout(rs_output)
@@ -272,22 +291,59 @@ if __name__ == "__main__":
     second_comm_group = dist.new_group(backend="nccl")
 
     data = _init_data()
+    logger = Logger(
+        job_name=f"rank{args.rank}", file_path=f"/home/qxc4fh/zeyu_workspace/toy_megatron/logs/rank{args.rank}.log"
+    ).logger
+
+    def run_bw_recoder(q):
+        bw_logger = Logger("BW", f"/home/qxc4fh/zeyu_workspace/toy_megatron/logs/netif_rank{args.rank}.log").logger
+        recv0 = psutil.net_io_counters(pernic=True)["ib0"].bytes_recv
+        sent0 = psutil.net_io_counters(pernic=True)["ib0"].bytes_sent
+        time0 = time.time()
+        while True:
+            time.sleep(0.003)
+            recv1 = psutil.net_io_counters(pernic=True)["ib0"].bytes_recv
+            sent1 = psutil.net_io_counters(pernic=True)["ib0"].bytes_sent
+            time1 = time.time()
+            time_diff = time1 - time0
+            bw_in = (recv1 - recv0) / time_diff / 1048576
+            bw_out = (sent1 - sent0) / time_diff / 1048576
+            bw_logger.info(f"{bw_in} {bw_out}")
+            recv0 = recv1
+            sent0 = sent1
+            time0 = time1
+            try:
+                q.get(False)
+                break
+            except Exception:
+                continue
+
+    mp_queue = mp.Queue()
+    rcd_p = mp.Process(target=run_bw_recoder, args=(mp_queue,))
+    rcd_p.start()
+
+    time.sleep(3)
 
     dist.barrier()
     with _Timer("end_to_end_time"):
 
-        def trace_handler(p):
-            p.export_chrome_trace("trace.json")
+        # def trace_handler(p):
+        #     p.export_chrome_trace("trace.json")
 
-        with profile(
-            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-            schedule=torch.profiler.schedule(wait=0, warmup=1, active=NUM_LAYERS - 1),
-            on_trace_ready=trace_handler,
-        ) as p:
-            for ly in range(NUM_LAYERS):
-                if ly == NUM_LAYERS - 5:
-                    for handle in send_handles:
-                        handle.wait()
-                    dist.barrier()
-                _run_layer()
-                p.step()
+        # with profile(
+        #     activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+        #     schedule=torch.profiler.schedule(wait=0, warmup=1, active=NUM_LAYERS - 1),
+        #     on_trace_ready=trace_handler,
+        # ) as p:
+        for ly in range(NUM_LAYERS):
+            # if ly == NUM_LAYERS - 5:
+            #     for handle in send_handles:
+            #         handle.wait()
+            #     dist.barrier()
+            _run_layer()
+            # p.step()
+
+    time.sleep(1)
+    mp_queue.put("END")
+    rcd_p.join()
+    # print("press ctrl-c to terminate it.")
