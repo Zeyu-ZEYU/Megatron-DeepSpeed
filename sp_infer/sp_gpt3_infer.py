@@ -22,19 +22,19 @@ from megatron.core.utils import divide
 from megatron.model.fused_bias_gelu import bias_gelu_impl
 from zutils import net as znet
 
-IPS = ["192.168.0.2", "192.168.0.3"]
-GPUS = [[0], [0]]
+IPS = ["10.155.48.72", "10.155.48.73", "10.155.48.68", "10.155.48.66"]
+GPUS = [[0], [0], [0], [0]]
 MASTER_DIST_PORT = 43214
 MASTER_SERVER_PORT = 43211
 NODE_SERVER_PORT = 34119
 CODE_NAME_FOR_SHELL = "sp_gpt3_infer.py"
-CODE_PATH_FOR_SHELL = "/home/hshen/zeyu/Megatron-DeepSpeed/sp_infer"
+CODE_PATH_FOR_SHELL = "/home/qxc4fh/zeyu/Megatron-DeepSpeed/sp_infer"
 
 
 # Inference config
 CONFIG = {}
-CONFIG["param_path"] = "/home/hshen/zeyu/large_files/gpt_params.pkl"
-CONFIG["tokenizer_path"] = "/home/hshen/zeyu/Megatron-DeepSpeed/gpt3_infer/gpt_tokenizer_kernel.pkl"
+CONFIG["param_path"] = "/home/qxc4fh/zeyu/large_files/gpt_params.pkl"
+CONFIG["tokenizer_path"] = "/home/qxc4fh/zeyu/Megatron-DeepSpeed/gpt3_infer/gpt_tokenizer_kernel.pkl"
 
 
 CONTEXT_LEN = 2048
