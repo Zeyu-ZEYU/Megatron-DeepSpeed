@@ -16,7 +16,7 @@ from torch.profiler import ProfilerActivity, profile, record_function
 # from flash_attn.flash_attn_interface import flash_attn_varlen_func
 
 
-RANK_0_IP = "10.155.48.77"
+RANK_0_IP = "192.168.0.3"
 RANK_0_PORT = 31187
 
 
@@ -24,7 +24,7 @@ BATCH_SIZE = 1
 PART_SEQ_LEN = 2048
 
 
-MODEL_DIM = 7680 * 8
+MODEL_DIM = 7680
 NUM_HEADS = 60
 assert MODEL_DIM % NUM_HEADS == 0
 HEAD_DIM = MODEL_DIM // NUM_HEADS
@@ -291,19 +291,17 @@ if __name__ == "__main__":
     second_comm_group = dist.new_group(backend="nccl")
 
     data = _init_data()
-    logger = Logger(
-        job_name=f"rank{args.rank}", file_path=f"/home/qxc4fh/zeyu_workspace/toy_megatron/logs/rank{args.rank}.log"
-    ).logger
+    logger = Logger(job_name=f"rank{args.rank}", file_path=f"/home/zeyu/tests/logs/rank{args.rank}.log").logger
 
     def run_bw_recoder(q):
-        bw_logger = Logger("BW", f"/home/qxc4fh/zeyu_workspace/toy_megatron/logs/netif_rank{args.rank}.log").logger
-        recv0 = psutil.net_io_counters(pernic=True)["ib0"].bytes_recv
-        sent0 = psutil.net_io_counters(pernic=True)["ib0"].bytes_sent
+        bw_logger = Logger("BW", f"/home/zeyu/tests/logs/netif_rank{args.rank}.log").logger
+        recv0 = psutil.net_io_counters(pernic=True)["enp161s0f0np0"].bytes_recv
+        sent0 = psutil.net_io_counters(pernic=True)["enp161s0f0np0"].bytes_sent
         time0 = time.time()
         while True:
             time.sleep(0.003)
-            recv1 = psutil.net_io_counters(pernic=True)["ib0"].bytes_recv
-            sent1 = psutil.net_io_counters(pernic=True)["ib0"].bytes_sent
+            recv1 = psutil.net_io_counters(pernic=True)["enp161s0f0np0"].bytes_recv
+            sent1 = psutil.net_io_counters(pernic=True)["enp161s0f0np0"].bytes_sent
             time1 = time.time()
             time_diff = time1 - time0
             bw_in = (recv1 - recv0) / time_diff / 1048576
