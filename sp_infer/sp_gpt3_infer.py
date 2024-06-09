@@ -22,11 +22,12 @@ from megatron.core.utils import divide
 from megatron.model.fused_bias_gelu import bias_gelu_impl
 from zutils import net as znet
 
-IPS = ["10.155.48.72", "10.155.48.73", "10.155.48.68", "10.155.48.66"]
-GPUS = [[0], [0], [0], [0]]
-MASTER_DIST_PORT = 43214
-MASTER_SERVER_PORT = 43211
-NODE_SERVER_PORT = 34119
+GENERATION_SERVER_IP = "10.155.48.72"
+GENERATION_SERVER_PORT = 43211
+MODEL_IPS = [GENERATION_SERVER_IP, "10.155.48.73", "10.155.48.68", "10.155.48.66"]
+MODEL_GPUS = [[0], [0], [0], [0]]
+CMD_SERVER_PORT = 34119
+NCCL_MASTER_PORT = 43214
 CODE_NAME_FOR_SHELL = "sp_gpt3_infer.py"
 CODE_PATH_FOR_SHELL = "/home/qxc4fh/zeyu/Megatron-DeepSpeed/sp_infer"
 
@@ -668,85 +669,33 @@ class GPTModel(torch.nn.Module):
             self.state_dict()[key].copy_(param.half())
 
 
-class DistributedGPTModel(torch.nn.Module):
-    def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
+class TextGeneration:
+    def __init__(self) -> None:
         num_wrks = 0
-        for node in GPUS:
+        for node in MODEL_GPUS:
             for _ in node:
                 num_wrks += 1
         self.num_wrks = num_wrks
         self.encoder_seq_length = self.num_wrks * CONTEXT_LEN
 
-        self.model_remote_conns = {}
-        self.model_local_conn = None
+        self.model_instance_conns = {}
 
-    def run_master(self, inputs, max_gen_len):
-        master_server_listener = znet.SocketMsger.tcp_listener("0.0.0.0", MASTER_SERVER_PORT)
+    def run(self, inputs, max_gen_len):
+        gen_listener = znet.SocketMsger.tcp_listener("0.0.0.0", GENERATION_SERVER_PORT)
 
-        def _run_listener_thread(listener, model_conns, num_wrks):
-            while True:
-                conn, _ = listener.accept()
-                rank = conn.recv()
-                model_conns[rank] = conn
-                if len(model_conns) == num_wrks:
-                    break
+        while True:
+            conn, _ = gen_listener.accept()
+            rank = conn.recv()
+            self.model_instance_conns[rank] = conn
+            if len(self.model_instance_conns) == self.num_wrks:
+                break
 
-        list_thread = threading.Thread(
-            target=_run_listener_thread, args=(master_server_listener, self.model_remote_conns, self.num_wrks)
-        )
-        list_thread.start()
-        threading.Thread(
-            target=self._execute_core,
-            args=(
-                0,
-                True,
-            ),
-        ).start()
-        list_thread.join()
         for i in range(self.num_wrks):
-            self.model_remote_conns[i].send("START")
+            self.model_instance_conns[i].send("START")
 
         resp_sentences, resp_sentences_seg = self._generate(inputs, max_gen_len)
 
         print(resp_sentences, resp_sentences_seg)
-
-    def _execute_core(self, rank, is_master=False):
-        world_size = self.num_wrks
-
-        if is_master:
-            assert rank == 0
-            listener_ip = "127.0.0.1"
-        else:
-            listener_ip = IPS[0]
-
-        gpus_idx = 0
-        gpu_id = None
-        for node in GPUS:
-            for gid in node:
-                if gpus_idx == rank:
-                    gpu_id = gid
-                    break
-                gpus_idx += 1
-            if gpu_id is not None:
-                break
-        assert gpu_id is not None
-
-        self.model_local_conn = znet.SocketMsger.tcp_connect(listener_ip, MASTER_SERVER_PORT)
-        self.model_local_conn.send(rank)
-        model = GPTModel(CONFIG["param_path"], f"cuda:{gpu_id}")
-        # get START cmd
-        self.model_local_conn.recv()
-        dist.init_process_group("nccl", init_method=f"tcp://{IPS[0]}:{MASTER_DIST_PORT}", rank=rank, world_size=world_size)
-
-        while True:
-            inputs = self.model_local_conn.recv()
-            if isinstance(inputs, str) and inputs == "EXIT":
-                self.model_local_conn.close()
-                return
-            with torch.no_grad():
-                output = model(inputs)
-            self.model_local_conn.send(output.cpu())
 
     def _generate(self, inputs, max_gen_len):
         tokenizer = GPTTokenizer(CONFIG["tokenizer_path"])
@@ -826,12 +775,12 @@ class DistributedGPTModel(torch.nn.Module):
                 positions2use = positions2use_list[i]
                 max_infer_len = max_infer_len_list[i]
                 inputs = [tokens2use, positions2use, set_inference_key_value_memory, max_infer_len]
-                model_conn = self.model_remote_conns[i]
+                model_conn = self.model_instance_conns[i]
                 model_conn.send(inputs)
 
             all_outputs = []
             for i in range(self.num_wrks):
-                model_conn = self.model_remote_conns[i]
+                model_conn = self.model_instance_conns[i]
                 all_outputs.append(model_conn.recv())
             output = torch.cat(all_outputs, 1)
 
@@ -891,8 +840,8 @@ class DistributedGPTModel(torch.nn.Module):
         resp_sentences_seg = []
 
         for i in range(self.num_wrks):
-            self.model_remote_conns[i].send("EXIT")
-            self.model_remote_conns[i].close()
+            self.model_instance_conns[i].send("EXIT")
+            self.model_instance_conns[i].close()
 
         decode_tokens = token_pool[:, :infer_cursor]
         decode_tokens = decode_tokens.numpy().tolist()
@@ -982,42 +931,82 @@ class DistributedGPTModel(torch.nn.Module):
         return (1 - boolean) * val1 + boolean * val2
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("-s", "--server", action="store_true")
-    parser.add_argument("-w", "--worker", action="store_true")
-    parser.add_argument("-r", "--rank", default=0, type=int)
-    args = parser.parse_args()
+class DistributedGPTModelWorker:
+    def __init__(self) -> None:
+        num_wrks = 0
+        for node in MODEL_GPUS:
+            for _ in node:
+                num_wrks += 1
+        self.num_wrks = num_wrks
 
-    if args.server:
-        listener = znet.SocketMsger.tcp_listener("0.0.0.0", NODE_SERVER_PORT)
+        self.generation_server_conn = None
+
+    def run(self, rank):
+        world_size = self.num_wrks
+
+        gpus_idx = 0
+        gpu_id = None
+        for node in MODEL_GPUS:
+            for gid in node:
+                if gpus_idx == rank:
+                    gpu_id = gid
+                    break
+                gpus_idx += 1
+            if gpu_id is not None:
+                break
+        assert gpu_id is not None
+
+        self.generation_server_conn = znet.SocketMsger.tcp_connect(GENERATION_SERVER_IP, GENERATION_SERVER_PORT)
+        self.generation_server_conn.send(rank)
+        model = GPTModel(CONFIG["param_path"], f"cuda:{gpu_id}")
+        # get cmd "START"
+        self.generation_server_conn.recv()
+        dist.init_process_group(
+            "nccl", init_method=f"tcp://{MODEL_IPS[0]}:{NCCL_MASTER_PORT}", rank=rank, world_size=world_size
+        )
 
         while True:
+            inputs = self.generation_server_conn.recv()
+            if isinstance(inputs, str) and inputs == "EXIT":
+                self.generation_server_conn.close()
+                return
+            with torch.no_grad():
+                output = model(inputs)
+            self.generation_server_conn.send(output.cpu())
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-r", "--model_rank", default=0, type=int)
+    parser.add_argument("-s", "--cmd_server", action="store_true")
+    parser.add_argument("-w", "--model_worker", action="store_true")
+    args = parser.parse_args()
+
+    if args.cmd_server:
+        listener = znet.SocketMsger.tcp_listener("0.0.0.0", CMD_SERVER_PORT)
+        while True:
             req_conn, _ = listener.accept()
-            cmds = req_conn.recv()
-            for cmd in cmds:
+            node_cmds = req_conn.recv()
+            for cmd in node_cmds:
                 subprocess.call(cmd, shell=True)
             req_conn.close()
     else:
-        if args.worker:
-            assert args.rank > 0
-            dist_gpt_model = DistributedGPTModel()
-            dist_gpt_model._execute_core(args.rank)
-        # the launcher
+        if args.model_worker:  # now support model_rank == 0 and run it as a worker via cmd_server
+            # assert args.model_rank > 0
+            model_worker = DistributedGPTModelWorker()
+            model_worker.run(args.model_rank)
+        # The generation server
         else:
-            remote_rank = 0
-            for node_idx in range(len(IPS)):
-                ip = IPS[node_idx]
-                node_gpus = GPUS[node_idx]
-                conn = znet.SocketMsger.tcp_connect(ip, NODE_SERVER_PORT)
-                cmds = []
+            remote_model_rank = 0
+            for node_idx in range(len(MODEL_IPS)):
+                node_ip = MODEL_IPS[node_idx]
+                node_gpus = MODEL_GPUS[node_idx]
+                node_conn = znet.SocketMsger.tcp_connect(node_ip, CMD_SERVER_PORT)
+                node_cmds = []
                 for _ in node_gpus:
-                    if remote_rank == 0:
-                        remote_rank += 1
-                        continue
-                    cmds.append(f"python3 {CODE_PATH_FOR_SHELL}/{CODE_NAME_FOR_SHELL} -w -r {remote_rank}")
-                    remote_rank += 1
-                conn.send(cmds)
-                conn.close()
-            dist_gpt_model = DistributedGPTModel()
-            dist_gpt_model.run_master(["How big is the universe?"], 100)
+                    node_cmds.append(f"python {CODE_PATH_FOR_SHELL}/{CODE_NAME_FOR_SHELL} -r {remote_model_rank} -w")
+                    remote_model_rank += 1
+                node_conn.send(node_cmds)
+                node_conn.close()
+            text_generation = TextGeneration()
+            text_generation.run(["How big is the universe?"], 100)

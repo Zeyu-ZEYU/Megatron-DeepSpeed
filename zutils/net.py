@@ -64,7 +64,7 @@ class SocketMsger:
         index = self.__recv_buffer.find(b"META(")
         while index == -1:
             try:
-                data = self.__socket.recv(4096)
+                data = self.__socket.recv(1048576)
                 if data == b"":
                     self.__closed = True
                     return
@@ -76,7 +76,7 @@ class SocketMsger:
         index = self.__recv_buffer.find(b")", meta_lindex)
         while index == -1:
             try:
-                data = self.__socket.recv(4096)
+                data = self.__socket.recv(1048576)
                 if data == b"":
                     self.__closed = True
                     return
@@ -91,7 +91,7 @@ class SocketMsger:
         body_lindex = meta_rindex + 1
         while len(self.__recv_buffer) - body_lindex < data_length:
             try:
-                data = self.__socket.recv(4096)
+                data = self.__socket.recv(1048576)
                 if data == b"":
                     self.__closed = True
                     return
