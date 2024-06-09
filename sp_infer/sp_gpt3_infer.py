@@ -669,6 +669,50 @@ class GPTModel(torch.nn.Module):
             self.state_dict()[key].copy_(param.half())
 
 
+class DistributedGPTModelWorker:
+    def __init__(self) -> None:
+        num_wrks = 0
+        for node in MODEL_GPUS:
+            for _ in node:
+                num_wrks += 1
+        self.num_wrks = num_wrks
+
+        self.generation_server_conn = None
+
+    def run(self, rank):
+        world_size = self.num_wrks
+
+        gpus_idx = 0
+        gpu_id = None
+        for node in MODEL_GPUS:
+            for gid in node:
+                if gpus_idx == rank:
+                    gpu_id = gid
+                    break
+                gpus_idx += 1
+            if gpu_id is not None:
+                break
+        assert gpu_id is not None
+
+        self.generation_server_conn = znet.SocketMsger.tcp_connect(GENERATION_SERVER_IP, GENERATION_SERVER_PORT)
+        self.generation_server_conn.send(rank)
+        model = GPTModel(CONFIG["param_path"], f"cuda:{gpu_id}")
+        # get cmd "START"
+        self.generation_server_conn.recv()
+        dist.init_process_group(
+            "nccl", init_method=f"tcp://{MODEL_IPS[0]}:{NCCL_MASTER_PORT}", rank=rank, world_size=world_size
+        )
+
+        while True:
+            inputs = self.generation_server_conn.recv()
+            if isinstance(inputs, str) and inputs == "EXIT":
+                self.generation_server_conn.close()
+                return
+            with torch.no_grad():
+                output = model(inputs)
+            self.generation_server_conn.send(output.cpu())
+
+
 class TextGeneration:
     def __init__(self) -> None:
         num_wrks = 0
@@ -929,50 +973,6 @@ class TextGeneration:
     def _switch(self, val1, val2, boolean):
         boolean = boolean.type_as(val1)
         return (1 - boolean) * val1 + boolean * val2
-
-
-class DistributedGPTModelWorker:
-    def __init__(self) -> None:
-        num_wrks = 0
-        for node in MODEL_GPUS:
-            for _ in node:
-                num_wrks += 1
-        self.num_wrks = num_wrks
-
-        self.generation_server_conn = None
-
-    def run(self, rank):
-        world_size = self.num_wrks
-
-        gpus_idx = 0
-        gpu_id = None
-        for node in MODEL_GPUS:
-            for gid in node:
-                if gpus_idx == rank:
-                    gpu_id = gid
-                    break
-                gpus_idx += 1
-            if gpu_id is not None:
-                break
-        assert gpu_id is not None
-
-        self.generation_server_conn = znet.SocketMsger.tcp_connect(GENERATION_SERVER_IP, GENERATION_SERVER_PORT)
-        self.generation_server_conn.send(rank)
-        model = GPTModel(CONFIG["param_path"], f"cuda:{gpu_id}")
-        # get cmd "START"
-        self.generation_server_conn.recv()
-        dist.init_process_group(
-            "nccl", init_method=f"tcp://{MODEL_IPS[0]}:{NCCL_MASTER_PORT}", rank=rank, world_size=world_size
-        )
-
-        while True:
-            inputs = self.generation_server_conn.recv()
-            if isinstance(inputs, str) and inputs == "EXIT":
-                self.generation_server_conn.close()
-                return
-            with torch.no_grad():
-                output = model(inputs)
-            self.generation_server_conn.send(output.cpu())
 
 
 if __name__ == "__main__":
