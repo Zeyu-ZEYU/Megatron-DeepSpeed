@@ -10,14 +10,7 @@
 
 import torch
 
-# Define the mapping
-mapping_tensor = torch.rand(16, dtype=torch.float16)  # Random float16 values
+a = torch.ones([2, 2], dtype=torch.int8, device="cuda:0")
+b = torch.ones([2, 2], dtype=torch.int8, device="cuda:0")
 
-# Move the tensor to GPU
-mapping_tensor = mapping_tensor.cuda()
-
-# Lookup example using torch.uint8 for indices
-indices = torch.tensor([0, 5, 14, 2], dtype=torch.int)  # Use uint8 for indices
-lookup_values = mapping_tensor[indices.cuda()]  # Perform lookup
-
-print("Lookup Results:", lookup_values)
+torch.matmul(a, b)

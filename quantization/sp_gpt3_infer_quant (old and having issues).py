@@ -1,7 +1,7 @@
 import argparse
-import math
 import pickle
 import subprocess
+import threading
 from contextlib import nullcontext
 from typing import Any, List, Optional
 
@@ -9,10 +9,9 @@ import einops
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
-import zc_bmm_uint8
 
 # from apex.normalization.fused_layer_norm import MixedFusedLayerNorm
-# from flash_attn.flash_attn_interface import flash_attn_varlen_func
+from flash_attn.flash_attn_interface import flash_attn_varlen_func
 from torch.nn.parameter import Parameter
 
 from megatron import core
@@ -23,20 +22,19 @@ from megatron.core.utils import divide
 from megatron.model.fused_bias_gelu import bias_gelu_impl
 from zutils import net as znet
 
-GENERATION_SERVER_IP = "10.155.48.72"
-GENERATION_SERVER_PORT = 43211
-MODEL_IPS = [GENERATION_SERVER_IP, "10.155.48.73", "10.155.48.68", "10.155.48.66"]
-MODEL_GPUS = [[0], [0], [0], [0]]
-CMD_SERVER_PORT = 34119
-NCCL_MASTER_PORT = 43214
-CODE_NAME_FOR_SHELL = "sp_gpt3_infer.py"
-CODE_PATH_FOR_SHELL = "/home/qxc4fh/zeyu/Megatron-DeepSpeed/sp_infer"
+IPS = ["192.168.0.2", "192.168.0.3"]
+GPUS = [[0], [0]]
+MASTER_DIST_PORT = 43214
+MASTER_SERVER_PORT = 43211
+NODE_SERVER_PORT = 34119
+CODE_NAME_FOR_SHELL = "sp_gpt3_infer_quant.py"
+CODE_PATH_FOR_SHELL = "/home/hshen/zeyu/Megatron-DeepSpeed/quantization"
 
 
 # Inference config
 CONFIG = {}
-CONFIG["param_path"] = "/home/qxc4fh/zeyu/large_files/gpt_params.pkl"
-CONFIG["tokenizer_path"] = "/home/qxc4fh/zeyu/Megatron-DeepSpeed/gpt3_infer/gpt_tokenizer_kernel.pkl"
+CONFIG["param_path"] = "/home/hshen/zeyu/large_files/gpt_params.pkl"
+CONFIG["tokenizer_path"] = "/home/hshen/zeyu/Megatron-DeepSpeed/gpt3_infer/gpt_tokenizer_kernel.pkl"
 
 
 CONTEXT_LEN = 2048
@@ -105,95 +103,32 @@ class _CoreAttention(torch.nn.Module):
     def __init__(self, layer_num, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self.layer_num = layer_num
-        self.softmax = torch.nn.Softmax(dim=-1)
-        self.attention_dropout = torch.nn.Dropout(0.1)
 
-    def forward(self, query_layer, key_layer, value_layer, quant_factors):
-        qmin, qscale, kmin, kscale, vmin, vscale = quant_factors
-
+    def forward(self, query_layer, key_layer, value_layer):
         # ===================================
         # Raw attention scores. [b, np, s, s]
         # ===================================
-
-        # [b, np, sq, sk]
-        output_size = (query_layer.size(1), query_layer.size(2), query_layer.size(0), key_layer.size(0))
-
-        # [sq, b, np, hn] -> [sq, b * np, hn]
-        query_layer = query_layer.view(output_size[2], output_size[0] * output_size[1], -1)
-        # [sk, b, np, hn] -> [sk, b * np, hn]
-        key_layer = key_layer.view(output_size[3], output_size[0] * output_size[1], -1)
-
-        # Raw attention scores. [b * np, sq, sk]
-        q_input = query_layer.transpose(0, 1)  # [b * np, sq, hn]
-        k_input = key_layer.transpose(0, 1).transpose(1, 2)  # [b * np, hn, sk]
-        matmul_result = zc_bmm_uint8.call(
-            q_input,  # [b * np, sq, hn]
-            k_input,  # [b * np, hn, sk]
+        batch_size = query_layer.size(1)
+        seqlen_q = query_layer.size(0)
+        seqlen_k = key_layer.size(0)
+        cu_seqlens_q = torch.arange(0, (batch_size + 1) * seqlen_q, step=seqlen_q, dtype=torch.int32, device=query_layer.device)
+        cu_seqlens_k = torch.arange(0, (batch_size + 1) * seqlen_k, step=seqlen_k, dtype=torch.int32, device=query_layer.device)
+        query_layer = einops.rearrange(query_layer, "s b h d -> (s b) h d")
+        key_layer = einops.rearrange(key_layer, "s b h d -> (s b) h d")
+        value_layer = einops.rearrange(value_layer, "s b h d -> (s b) h d")
+        output = flash_attn_varlen_func(
+            query_layer,
+            key_layer,
+            value_layer,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            seqlen_q,
+            seqlen_k,
+            0.1,
+            causal=True,
         )
-
-        # <aX + b, cY + d> = ac<X, Y> + ad*sum(X) + bc*sum(Y) + bdn, where n=128
-        # a=qscale, b=qmin, c=kscale, d=kmin
-        qmin = einops.rearrange(qmin, "s b h v -> (b h) s v")
-        qscale = einops.rearrange(qscale, "s b h v -> (b h) s v")
-        kmin = einops.rearrange(kmin, "s b h v -> (b h) v s")
-        kscale = einops.rearrange(kscale, "s b h v -> (b h) v s")
-        attention_scores = (
-            torch.bmm(qscale, kscale) * matmul_result
-            + torch.bmm(qscale * torch.sum(q_input, dim=-1, keepdim=True), kmin)
-            + torch.bmm(qmin, kscale * torch.sum(k_input, dim=-2, keepdim=True))
-            + HIDDEN_SIZE / NUM_HEADS * torch.bmm(qmin, kmin)
-        )
-
-        # apply the scaling factor of attention socres
-        matmul_result /= math.sqrt(HIDDEN_SIZE % NUM_HEADS)
-
-        # change view to [b, np, sq, sk]
-        attention_scores = matmul_result.view(*output_size)
-
-        ### TODO:
-        ### Apply an attention mask to attention_scores.
-
-        # attention scores and attention mask [b, np, sq, sk]
-        attention_probs = self.softmax(attention_scores)
-
-        # This is actually dropping out entire tokens to attend to, which might
-        # seem a bit unusual, but is taken from the original Transformer paper.
-        attention_probs = self.attention_dropout(attention_probs)
-
-        # =========================
-        # Context layer. [sq, b, hp]
-        # =========================
-
-        # value_layer -> context layer.
-        # [sk, b, np, hn] --> [b, np, sq, hn]
-
-        # context layer shape: [b, np, sq, hn]
-        output_size = (value_layer.size(1), value_layer.size(2), query_layer.size(0), value_layer.size(3))
-
-        # change view [sk, b * np, hn]
-        value_layer = value_layer.view(value_layer.size(0), output_size[0] * output_size[1], -1)
-        # dequantize value_layer
-        vmin = einops.rearrange(vmin, "s b h v -> s (b h) v")
-        vscale = einops.rearrange(vscale, "s b h v -> s (b h) v")
-        value_layer = vscale * value_layer + vmin
-
-        # change view [b * np, sq, sk]
-        attention_probs = attention_probs.view(output_size[0] * output_size[1], output_size[2], -1)
-
-        # matmul: [b * np, sq, hn]
-        context_layer = torch.bmm(attention_probs, value_layer.transpose(0, 1))
-
-        # change view [b, np, sq, hn]
-        context_layer = context_layer.view(*output_size)
-
-        # [b, np, sq, hn] --> [sq, b, np, hn]
-        context_layer = context_layer.permute(2, 0, 1, 3).contiguous()
-
-        # [sq, b, np, hn] --> [sq, b, hp]
-        new_context_layer_shape = context_layer.size()[:-2] + (context_layer.size(2) * context_layer.size(3),)
-        context_layer = context_layer.view(*new_context_layer_shape)
-
-        return context_layer
+        output = einops.rearrange(output, "(s b) h d -> s b (h d)", b=batch_size, s=seqlen_q)
+        return output
 
 
 class _SeqAllToAll(torch.autograd.Function):
@@ -228,8 +163,106 @@ class _SeqAllToAll(torch.autograd.Function):
                 for _ in range(dist.get_world_size())
             ]
 
+        # quantize input data
+        if is_first_seq_a2a:
+            if input.size(0) == 0:
+                min = 0
+                step = 0
+                for i in range(seq_world_size):
+                    inp_i = input_list[i]
+                    new_inp = torch.empty(
+                        [inp_i.size(0), inp_i.size(1), inp_i.size(2), inp_i.size(3) // 2],
+                        dtype=torch.uint8,
+                        device=inp_i.device,
+                    )
+                    input_list[i] = new_inp
+            else:
+                max = torch.max(input).item()
+                min = torch.min(input).item()
+                step = (max - min) / 16
+                for i in range(seq_world_size):
+                    inp = input_list[i]
+                    inp = (inp - min + (step / 2)) // step
+                    inp = inp.to(torch.uint8)
+                    h_dim = inp.size(3)
+                    inp1 = inp[:, :, :, : h_dim // 2] << 4
+                    inp2 = inp[:, :, :, h_dim // 2 :]
+                    new_inp = inp1.contiguous() + inp2.contiguous()
+                    input_list[i] = new_inp
+            for i in range(seq_world_size):
+                out_i = output_list[i]
+                new_out = torch.empty(
+                    [out_i.size(0), out_i.size(1), out_i.size(2), out_i.size(3) // 2],
+                    dtype=torch.uint8,
+                    device=out_i.device,
+                )
+                output_list[i] = new_out
+            quan_input_list = [
+                torch.tensor([min, step], dtype=torch.float16, device=input.device) for _ in range(seq_world_size)
+            ]
+            quan_output_list = [torch.tensor([0, 0], dtype=torch.float16, device=input.device) for _ in range(seq_world_size)]
+            dist.all_to_all(quan_output_list, quan_input_list)
+        else:
+            max = torch.max(input).item()
+            min = torch.min(input).item()
+            step = (max - min) / 16
+            for i in range(seq_world_size):
+                inp = input_list[i]
+                inp = (inp - min + (step / 2)) // step
+                inp = inp.to(torch.uint8)
+                hid_dim = inp.size(2)
+                inp1 = inp[:, :, : hid_dim // 2] << 4
+                inp2 = inp[:, :, hid_dim // 2 :]
+                new_inp = inp1.contiguous() + inp2.contiguous()
+                input_list[i] = new_inp
+            for i in range(seq_world_size):
+                out_i = output_list[i]
+                new_out = torch.empty(
+                    [out_i.size(0), out_i.size(1), out_i.size(2) // 2],
+                    dtype=torch.uint8,
+                    device=out_i.device,
+                )
+                output_list[i] = new_out
+            quan_input_list = [
+                torch.tensor([min, step], dtype=torch.float16, device=input.device) for _ in range(seq_world_size)
+            ]
+            quan_output_list = [torch.tensor([0, 0], dtype=torch.float16, device=input.device) for _ in range(seq_world_size)]
+            dist.all_to_all(quan_output_list, quan_input_list)
+
         # TODO Use all_to_all_single instead
         dist.all_to_all(output_list, input_list)
+
+        # dequantize
+        if is_first_seq_a2a:
+            for i in range(seq_world_size):
+                quan_out = output_list[i]
+                if quan_out.size(0) == 0:
+                    dequan_out = torch.empty(
+                        [quan_out.size(0), quan_out.size(1), quan_out.size(2), quan_out.size(3) * 2],
+                        dtype=torch.float16,
+                        device=quan_out.device,
+                    )
+                    output_list[i] = dequan_out
+                else:
+                    dequan_out_1 = quan_out >> 4
+                    dequan_out_2 = quan_out << 4 >> 4
+                    dequan_out = torch.cat([dequan_out_1, dequan_out_2], dim=3).contiguous().to(torch.float16)
+                    output_list[i] = dequan_out * quan_output_list[i][1] + quan_output_list[i][0]
+        else:
+            for i in range(seq_world_size):
+                quan_out = output_list[i]
+                if quan_out.size(0) == 0:
+                    dequan_out = torch.empty(
+                        [quan_out.size(0), quan_out.size(1), quan_out.size(3) * 2],
+                        dtype=torch.float16,
+                        device=quan_out.device,
+                    )
+                    output_list[i] = dequan_out
+                else:
+                    dequan_out_1 = quan_out >> 4
+                    dequan_out_2 = quan_out << 4 >> 4
+                    dequan_out = torch.cat([dequan_out_1, dequan_out_2], dim=2).contiguous().to(torch.float16)
+                    output_list[i] = dequan_out * quan_output_list[i][1] + quan_output_list[i][0]
 
         return torch.cat(output_list, dim=gather_idx).contiguous()
 
@@ -271,16 +304,6 @@ class _DistributedAttention(torch.nn.Module):
         is_prompt = args[0]
         current_seq_len = args[1]
 
-        quant_factors = args[2]
-        qmin = quant_factors[0]
-        qscale = quant_factors[1]
-        kmin = quant_factors[2]
-        kscale = quant_factors[3]
-        vmin = quant_factors[4]
-        vscale = quant_factors[5]
-        q_min_scale = torch.cat((qmin, qscale), dim=-1)
-        kv_min_scale = torch.cat((kmin, kscale, vmin, vscale), dim=-1)
-
         num_tokens = query.size(0)
         num_tokens_tensor = torch.tensor(num_tokens, device=query.device)
         num_tokens_list = [torch.empty_like(num_tokens_tensor, device=query.device) for _ in range(dist.get_world_size())]
@@ -302,23 +325,8 @@ class _DistributedAttention(torch.nn.Module):
         key_layer = _SeqAllToAll.apply(key, self.scatter_idx, self.gather_idx, seq_len_list)
         value_layer = _SeqAllToAll.apply(value, self.scatter_idx, self.gather_idx, seq_len_list)
 
-        q_min_scale = _SeqAllToAll.apply(q_min_scale, self.scatter_idx, self.gather_idx, num_tokens_list)
-        kv_min_scale = _SeqAllToAll.apply(kv_min_scale, self.scatter_idx, self.gather_idx, seq_len_list)
-        qmin, qscale = torch.tensor_split(q_min_scale, 2, dim=-1)
-        kmin, kscale, vmin, vscale = torch.tensor_split(kv_min_scale, 4, dim=-1)
-
-        q1 = query_layer >> 4
-        q2 = query_layer << 4 >> 4
-        query_layer = torch.cat([q1, q2], dim=-1)
-        k1 = key_layer >> 4
-        k2 = key_layer << 4 >> 4
-        key_layer = torch.cat([k1, k2], dim=-1)
-        v1 = value_layer >> 4
-        v2 = value_layer << 4 >> 4
-        value_layer = torch.cat([v1, v2], dim=-1)
-
         # out shape : e.g., [s:h/p:]
-        context_layer = self.core_attn(query_layer, key_layer, value_layer, (qmin, qscale, kmin, kscale, vmin, vscale))
+        context_layer = self.core_attn(query_layer, key_layer, value_layer)
 
         output = _SeqAllToAll.apply(context_layer, self.gather_idx, self.scatter_idx, num_tokens_list, False)
 
@@ -386,12 +394,6 @@ class Attention(torch.nn.Module):
         self.inference_value_memory = None
         self.inference_current_sequence_len = 0
 
-        # Quantization
-        self.quant_kmin = None
-        self.quant_kscaling = None
-        self.quant_vmin = None
-        self.quant_vscaling = None
-
     def forward(self, hidden_states, set_inference_key_value_memory=False, inference_max_sequence_len=None):
         # hidden_states: [sq, b, h]
         if inference_max_sequence_len is not None and inference_max_sequence_len == 0:
@@ -403,10 +405,10 @@ class Attention(torch.nn.Module):
         if set_inference_key_value_memory:
             assert inference_max_sequence_len is not None and inference_max_sequence_len >= 0
             self.inference_key_memory = self._allocate_memory(
-                inference_max_sequence_len, hidden_states.size(1), torch.uint8, hidden_states.device
+                inference_max_sequence_len, hidden_states.size(1), hidden_states.dtype, hidden_states.device
             )
             self.inference_value_memory = self._allocate_memory(
-                inference_max_sequence_len, hidden_states.size(1), torch.uint8, hidden_states.device
+                inference_max_sequence_len, hidden_states.size(1), hidden_states.dtype, hidden_states.device
             )
             self.inference_current_sequence_len = 0
 
@@ -420,11 +422,6 @@ class Attention(torch.nn.Module):
         if inference_max_sequence_len is None:
             self.inference_key_memory = None
             self.inference_value_memory = None
-
-            self.quant_kmin = None
-            self.quant_kscaling = None
-            self.quant_vmin = None
-            self.quant_vscaling = None
 
         # =====================
         # Query, Key, and Value
@@ -442,41 +439,6 @@ class Attention(torch.nn.Module):
 
         # [sq, b, np, 3 * hn] --> 3 [sq, b, np, hn]
         (query_layer, key_layer, value_layer) = split_tensor_along_last_dim(mixed_x_layer, 3)
-
-        # Quantization
-        quant_qmax = torch.max(query_layer, dim=3, keepdim=True).values
-        quant_qmin = torch.min(query_layer, dim=3, keepdim=True).values
-        quant_qscaling = (quant_qmax - quant_qmin) / 16
-        quant_kmax = torch.max(key_layer, dim=3, keepdim=True).values
-        quant_kmin = torch.min(key_layer, dim=3, keepdim=True).values
-        quant_kscaling = (quant_kmax - quant_kmin) / 16
-        quant_vmax = torch.max(value_layer, dim=3, keepdim=True).values
-        quant_vmin = torch.min(value_layer, dim=3, keepdim=True).values
-        quant_vscaling = (quant_vmax - quant_vmin) / 16
-        if self.quant_kmin is None:
-            self.quant_kmin = quant_kmin
-            self.quant_kscaling = quant_kscaling
-            self.quant_vmin = quant_vmin
-            self.quant_vscaling = quant_vscaling
-        else:
-            self.quant_kmin = torch.cat((self.quant_kmin, quant_kmin), dim=0)
-            self.quant_kscaling = torch.cat((self.quant_kscaling, quant_kscaling), dim=0)
-            self.quant_vmin = torch.cat((self.quant_vmin, quant_vmin), dim=0)
-            self.quant_vscaling = torch.cat((self.quant_vscaling, quant_vscaling), dim=0)
-        query_layer = ((query_layer - quant_qmin + quant_qscaling / 2) / quant_qscaling).to(torch.uint8)
-        key_layer = ((key_layer - quant_kmin + quant_kscaling / 2) / quant_kscaling).to(torch.uint8)
-        value_layer = ((value_layer - quant_vmin + quant_vscaling / 2) / quant_vscaling).to(torch.uint8)
-
-        # Pack two uint4 into one uint8
-        q1 = query_layer[..., 0:64] << 4
-        q2 = query_layer[..., 64:128]
-        query_layer = q1 + q2
-        k1 = key_layer[..., 0:64] << 4
-        k2 = key_layer[..., 64:128]
-        key_layer = k1 + k2
-        v1 = value_layer[..., 0:64] << 4
-        v2 = value_layer[..., 64:128]
-        value_layer = v1 + v2
 
         # ===================================================
         # Adjust key, value, and attention mask for inference
@@ -498,7 +460,6 @@ class Attention(torch.nn.Module):
             value_layer,
             set_inference_key_value_memory,
             self.inference_current_sequence_len,
-            (quant_qmin, quant_qscaling, self.quant_kmin, self.quant_kscaling, self.quant_vmin, self.quant_vscaling),
         )
         output, bias = self.dense(context_layer)
 
@@ -509,7 +470,7 @@ class Attention(torch.nn.Module):
             inference_max_sequence_len,
             batch_size,
             NUM_HEADS,
-            HIDDEN_SIZE // NUM_HEADS // 2,
+            HIDDEN_SIZE // NUM_HEADS,
             dtype=dtype,
             device=device,
         )
@@ -805,22 +766,61 @@ class GPTModel(torch.nn.Module):
             self.state_dict()[key].copy_(param.half())
 
 
-class DistributedGPTModelWorker:
-    def __init__(self) -> None:
+class DistributedGPTModel(torch.nn.Module):
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
         num_wrks = 0
-        for node in MODEL_GPUS:
+        for node in GPUS:
             for _ in node:
                 num_wrks += 1
         self.num_wrks = num_wrks
+        self.encoder_seq_length = self.num_wrks * CONTEXT_LEN
 
-        self.generation_server_conn = None
+        self.model_remote_conns = {}
+        self.model_local_conn = None
 
-    def run(self, rank):
+    def run_master(self, inputs, max_gen_len):
+        master_server_listener = znet.SocketMsger.tcp_listener("0.0.0.0", MASTER_SERVER_PORT)
+
+        def _run_listener_thread(listener, model_conns, num_wrks):
+            while True:
+                conn, _ = listener.accept()
+                rank = conn.recv()
+                model_conns[rank] = conn
+                if len(model_conns) == num_wrks:
+                    break
+
+        list_thread = threading.Thread(
+            target=_run_listener_thread, args=(master_server_listener, self.model_remote_conns, self.num_wrks)
+        )
+        list_thread.start()
+        threading.Thread(
+            target=self._execute_core,
+            args=(
+                0,
+                True,
+            ),
+        ).start()
+        list_thread.join()
+        for i in range(self.num_wrks):
+            self.model_remote_conns[i].send("START")
+
+        resp_sentences, resp_sentences_seg = self._generate(inputs, max_gen_len)
+
+        print(resp_sentences, resp_sentences_seg)
+
+    def _execute_core(self, rank, is_master=False):
         world_size = self.num_wrks
+
+        if is_master:
+            assert rank == 0
+            listener_ip = "127.0.0.1"
+        else:
+            listener_ip = IPS[0]
 
         gpus_idx = 0
         gpu_id = None
-        for node in MODEL_GPUS:
+        for node in GPUS:
             for gid in node:
                 if gpus_idx == rank:
                     gpu_id = gid
@@ -830,52 +830,21 @@ class DistributedGPTModelWorker:
                 break
         assert gpu_id is not None
 
-        self.generation_server_conn = znet.SocketMsger.tcp_connect(GENERATION_SERVER_IP, GENERATION_SERVER_PORT)
-        self.generation_server_conn.send(rank)
+        self.model_local_conn = znet.SocketMsger.tcp_connect(listener_ip, MASTER_SERVER_PORT)
+        self.model_local_conn.send(rank)
         model = GPTModel(CONFIG["param_path"], f"cuda:{gpu_id}")
-        # get cmd "START"
-        self.generation_server_conn.recv()
-        dist.init_process_group(
-            "nccl", init_method=f"tcp://{MODEL_IPS[0]}:{NCCL_MASTER_PORT}", rank=rank, world_size=world_size
-        )
+        # get START cmd
+        self.model_local_conn.recv()
+        dist.init_process_group("nccl", init_method=f"tcp://{IPS[0]}:{MASTER_DIST_PORT}", rank=rank, world_size=world_size)
 
         while True:
-            inputs = self.generation_server_conn.recv()
+            inputs = self.model_local_conn.recv()
             if isinstance(inputs, str) and inputs == "EXIT":
-                self.generation_server_conn.close()
+                self.model_local_conn.close()
                 return
             with torch.no_grad():
                 output = model(inputs)
-            self.generation_server_conn.send(output.cpu())
-
-
-class TextGeneration:
-    def __init__(self) -> None:
-        num_wrks = 0
-        for node in MODEL_GPUS:
-            for _ in node:
-                num_wrks += 1
-        self.num_wrks = num_wrks
-        self.encoder_seq_length = self.num_wrks * CONTEXT_LEN
-
-        self.model_instance_conns = {}
-
-    def run(self, inputs, max_gen_len):
-        gen_listener = znet.SocketMsger.tcp_listener("0.0.0.0", GENERATION_SERVER_PORT)
-
-        while True:
-            conn, _ = gen_listener.accept()
-            rank = conn.recv()
-            self.model_instance_conns[rank] = conn
-            if len(self.model_instance_conns) == self.num_wrks:
-                break
-
-        for i in range(self.num_wrks):
-            self.model_instance_conns[i].send("START")
-
-        resp_sentences, resp_sentences_seg = self._generate(inputs, max_gen_len)
-
-        print(resp_sentences, resp_sentences_seg)
+            self.model_local_conn.send(output.cpu())
 
     def _generate(self, inputs, max_gen_len):
         tokenizer = GPTTokenizer(CONFIG["tokenizer_path"])
@@ -955,12 +924,12 @@ class TextGeneration:
                 positions2use = positions2use_list[i]
                 max_infer_len = max_infer_len_list[i]
                 inputs = [tokens2use, positions2use, set_inference_key_value_memory, max_infer_len]
-                model_conn = self.model_instance_conns[i]
+                model_conn = self.model_remote_conns[i]
                 model_conn.send(inputs)
 
             all_outputs = []
             for i in range(self.num_wrks):
-                model_conn = self.model_instance_conns[i]
+                model_conn = self.model_remote_conns[i]
                 all_outputs.append(model_conn.recv())
             output = torch.cat(all_outputs, 1)
 
@@ -1020,8 +989,8 @@ class TextGeneration:
         resp_sentences_seg = []
 
         for i in range(self.num_wrks):
-            self.model_instance_conns[i].send("EXIT")
-            self.model_instance_conns[i].close()
+            self.model_remote_conns[i].send("EXIT")
+            self.model_remote_conns[i].close()
 
         decode_tokens = token_pool[:, :infer_cursor]
         decode_tokens = decode_tokens.numpy().tolist()
@@ -1113,36 +1082,40 @@ class TextGeneration:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("-r", "--model_rank", default=0, type=int)
-    parser.add_argument("-s", "--cmd_server", action="store_true")
-    parser.add_argument("-w", "--model_worker", action="store_true")
+    parser.add_argument("-s", "--server", action="store_true")
+    parser.add_argument("-w", "--worker", action="store_true")
+    parser.add_argument("-r", "--rank", default=0, type=int)
     args = parser.parse_args()
 
-    if args.cmd_server:
-        listener = znet.SocketMsger.tcp_listener("0.0.0.0", CMD_SERVER_PORT)
+    if args.server:
+        listener = znet.SocketMsger.tcp_listener("0.0.0.0", NODE_SERVER_PORT)
+
         while True:
             req_conn, _ = listener.accept()
-            node_cmds = req_conn.recv()
-            for cmd in node_cmds:
+            cmds = req_conn.recv()
+            for cmd in cmds:
                 subprocess.call(cmd, shell=True)
             req_conn.close()
     else:
-        if args.model_worker:  # now support model_rank == 0 and run it as a worker via cmd_server
-            # assert args.model_rank > 0
-            model_worker = DistributedGPTModelWorker()
-            model_worker.run(args.model_rank)
-        # The generation server
+        if args.worker:
+            assert args.rank > 0
+            dist_gpt_model = DistributedGPTModel()
+            dist_gpt_model._execute_core(args.rank)
+        # the launcher
         else:
-            remote_model_rank = 0
-            for node_idx in range(len(MODEL_IPS)):
-                node_ip = MODEL_IPS[node_idx]
-                node_gpus = MODEL_GPUS[node_idx]
-                node_conn = znet.SocketMsger.tcp_connect(node_ip, CMD_SERVER_PORT)
-                node_cmds = []
+            remote_rank = 0
+            for node_idx in range(len(IPS)):
+                ip = IPS[node_idx]
+                node_gpus = GPUS[node_idx]
+                conn = znet.SocketMsger.tcp_connect(ip, NODE_SERVER_PORT)
+                cmds = []
                 for _ in node_gpus:
-                    node_cmds.append(f"python {CODE_PATH_FOR_SHELL}/{CODE_NAME_FOR_SHELL} -r {remote_model_rank} -w")
-                    remote_model_rank += 1
-                node_conn.send(node_cmds)
-                node_conn.close()
-            text_generation = TextGeneration()
-            text_generation.run(["How big is the universe?"], 100)
+                    if remote_rank == 0:
+                        remote_rank += 1
+                        continue
+                    cmds.append(f"python3 {CODE_PATH_FOR_SHELL}/{CODE_NAME_FOR_SHELL} -w -r {remote_rank}")
+                    remote_rank += 1
+                conn.send(cmds)
+                conn.close()
+            dist_gpt_model = DistributedGPTModel()
+            dist_gpt_model.run_master(["How big is the universe?"], 100)

@@ -5,11 +5,17 @@ setup(
     name="zeroc_cuda",
     ext_modules=[
         CUDAExtension(
+            "zc_bmm_uint8",
+            [
+                "zc_bmm_uint8.cu",
+            ],
+        ),
+        CUDAExtension(
             "zc_softmax",
             [
                 "zc_softmax.cu",
             ],
-        )
+        ),
     ],
     cmdclass={"build_ext": BuildExtension},
 )

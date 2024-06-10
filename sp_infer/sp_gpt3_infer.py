@@ -1,7 +1,6 @@
 import argparse
 import pickle
 import subprocess
-import threading
 from contextlib import nullcontext
 from typing import Any, List, Optional
 
