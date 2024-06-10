@@ -5,6 +5,12 @@ setup(
     name="zeroc_cuda",
     ext_modules=[
         CUDAExtension(
+            "zc_bmm_half",
+            [
+                "zc_bmm_half.cu",
+            ],
+        ),
+        CUDAExtension(
             "zc_bmm_uint8",
             [
                 "zc_bmm_uint8.cu",
