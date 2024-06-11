@@ -2,7 +2,6 @@ import argparse
 import math
 import pickle
 import subprocess
-import time
 from contextlib import nullcontext
 from typing import Any, List, Optional
 
@@ -30,7 +29,7 @@ MODEL_IPS = [GENERATION_SERVER_IP, "10.155.48.73", "10.155.48.68", "10.155.48.66
 MODEL_GPUS = [[0], [0], [0], [0]]
 CMD_SERVER_PORT = 34119
 NCCL_MASTER_PORT = 43214
-CODE_NAME_FOR_SHELL = "sp_gpt3_infer_quant.py"
+CODE_NAME_FOR_SHELL = "sp_gpt3_infer_quant_basecode.py"
 CODE_PATH_FOR_SHELL = "/home/qxc4fh/zeyu/Megatron-DeepSpeed/quantization"
 
 
@@ -47,35 +46,6 @@ NUM_HEADS = 16
 MLP_HIDDEN_SIZE = 3072
 VOCAB_SIZE = 50304
 assert HIDDEN_SIZE % NUM_HEADS == 0
-
-
-def _singleton_timer(cls):
-    timers = {}
-
-    def get_timer(name):
-        if name not in timers:
-            timers[name] = cls(name)
-        return timers[name]
-
-    return get_timer
-
-
-@_singleton_timer
-class _Timer:
-    def __init__(self, name) -> None:
-        self.name = name
-        self.total_time = 0
-
-    def __enter__(self):
-        torch.cuda.synchronize()
-        self.start = time.time()
-        return self
-
-    def __exit__(self, *args):
-        torch.cuda.synchronize()
-        interval = 1000 * (time.time() - self.start)
-        self.total_time += interval
-        print(f"{self.name}: {interval}ms out of {self.total_time}ms.")
 
 
 class _VocabEmbedding(torch.nn.Module):
