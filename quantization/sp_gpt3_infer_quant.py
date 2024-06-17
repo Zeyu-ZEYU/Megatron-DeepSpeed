@@ -10,6 +10,7 @@ import einops
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+import zc_blas
 
 # from apex.normalization.fused_layer_norm import MixedFusedLayerNorm
 # from flash_attn.flash_attn_interface import flash_attn_varlen_func
@@ -23,39 +24,36 @@ from megatron.core.utils import divide
 from megatron.model.fused_bias_gelu import bias_gelu_impl
 from zutils import net as znet
 
-# import zc_bmm_uint8
-
-
-# GENERATION_SERVER_IP = "10.155.48.71"
-# GENERATION_SERVER_PORT = 43211
-# MODEL_IPS = [GENERATION_SERVER_IP, "10.155.48.70", "10.155.48.73", "10.155.48.76"]
-# MODEL_GPUS = [[0], [0], [0], [0]]
-# CMD_SERVER_PORT = 34119
-# NCCL_MASTER_PORT = 43214
-# CODE_NAME_FOR_SHELL = "sp_gpt3_infer_quant.py"
-# CODE_PATH_FOR_SHELL = "/home/qxc4fh/zeyu/Megatron-DeepSpeed/quantization"
-
-
-# # Inference config
-# CONFIG = {}
-# CONFIG["param_path"] = "/home/qxc4fh/zeyu/large_files/gpt_params.pkl"
-# CONFIG["tokenizer_path"] = "/home/qxc4fh/zeyu/Megatron-DeepSpeed/gpt3_infer/gpt_tokenizer_kernel.pkl"
-
-
-GENERATION_SERVER_IP = "192.168.0.3"
+GENERATION_SERVER_IP = "10.155.48.70"
 GENERATION_SERVER_PORT = 43211
-MODEL_IPS = [GENERATION_SERVER_IP, "192.168.0.4"]
-MODEL_GPUS = [[0], [0]]
+MODEL_IPS = [GENERATION_SERVER_IP, "10.155.48.76", "10.155.48.75", "10.155.48.73"]
+MODEL_GPUS = [[0], [0], [0], [0]]
 CMD_SERVER_PORT = 34119
-NCCL_MASTER_PORT = 43614
+NCCL_MASTER_PORT = 43214
 CODE_NAME_FOR_SHELL = "sp_gpt3_infer_quant.py"
-CODE_PATH_FOR_SHELL = "/home/zeyu/Megatron-DeepSpeed/quantization"
+CODE_PATH_FOR_SHELL = "/home/qxc4fh/zeyu/Megatron-DeepSpeed/quantization"
 
 
 # Inference config
 CONFIG = {}
-CONFIG["param_path"] = "/home/zeyu/large_files/gpt_params.pkl"
-CONFIG["tokenizer_path"] = "/home/zeyu/Megatron-DeepSpeed/gpt3_infer/gpt_tokenizer_kernel.pkl"
+CONFIG["param_path"] = "/home/qxc4fh/zeyu/large_files/gpt_params.pkl"
+CONFIG["tokenizer_path"] = "/home/qxc4fh/zeyu/Megatron-DeepSpeed/gpt3_infer/gpt_tokenizer_kernel.pkl"
+
+
+# GENERATION_SERVER_IP = "192.168.0.3"
+# GENERATION_SERVER_PORT = 43211
+# MODEL_IPS = [GENERATION_SERVER_IP, "192.168.0.4"]
+# MODEL_GPUS = [[0], [0]]
+# CMD_SERVER_PORT = 34119
+# NCCL_MASTER_PORT = 43614
+# CODE_NAME_FOR_SHELL = "sp_gpt3_infer_quant.py"
+# CODE_PATH_FOR_SHELL = "/home/zeyu/Megatron-DeepSpeed/quantization"
+
+
+# # Inference config
+# CONFIG = {}
+# CONFIG["param_path"] = "/home/zeyu/large_files/gpt_params.pkl"
+# CONFIG["tokenizer_path"] = "/home/zeyu/Megatron-DeepSpeed/gpt3_infer/gpt_tokenizer_kernel.pkl"
 
 
 CONTEXT_LEN = 2048
@@ -173,17 +171,15 @@ class _CoreAttention(torch.nn.Module):
 
         # Raw attention scores. [b * np, sq, sk]
         q_input = query_layer.transpose(0, 1)  # [b * np, sq, hn]
-        k_input = key_layer.transpose(0, 1).transpose(1, 2)  # [b * np, hn, sk]
-        q_input = q_input.to(torch.int8)
-        k_input = k_input.to(torch.int8)
-
-        print(q_input.shape)
-        print(k_input.shape)
-        with _Timer("Matrix"):
-            matmul_result = torch.bmm(
+        k_input = key_layer.transpose(0, 1)  # [b * np, sk, hn]
+        with _Timer("QK_matmul"):
+            matmul_result = zc_blas.bmm_uint8(
                 q_input,  # [b * np, sq, hn]
                 k_input,  # [b * np, hn, sk]
             )
+
+        with _Timer("QK_to_uint16"):
+            matmul_result = matmul_result.to(torch.uint16)
 
         # <aX + b, cY + d> = ac<X, Y> + ad*sum(X) + bc*sum(Y) + bdn, where n=128
         # a=qscale, b=qmin, c=kscale, d=kmin
@@ -191,12 +187,13 @@ class _CoreAttention(torch.nn.Module):
         qscale = einops.rearrange(qscale, "s b h v -> (b h) s v")
         kmin = einops.rearrange(kmin, "s b h v -> (b h) v s")
         kscale = einops.rearrange(kscale, "s b h v -> (b h) v s")
-        attention_scores = (
-            torch.bmm(qscale, kscale) * matmul_result
-            + torch.bmm(qscale * torch.sum(q_input, dim=-1, keepdim=True), kmin)
-            + torch.bmm(qmin, kscale * torch.sum(k_input, dim=-2, keepdim=True))
-            + HIDDEN_SIZE / NUM_HEADS * torch.bmm(qmin, kmin)
-        )
+        with _Timer("recover_QK"):
+            attention_scores = (
+                torch.bmm(qscale, kscale) * matmul_result
+                + torch.bmm(qscale * torch.sum(q_input, dim=-1, keepdim=True), kmin)
+                + torch.bmm(qmin, kscale * torch.sum(k_input, dim=-2, keepdim=True))
+                + HIDDEN_SIZE / NUM_HEADS * torch.bmm(qmin, kmin)
+            )
 
         # apply the scaling factor of attention socres
         matmul_result /= math.sqrt(HIDDEN_SIZE % NUM_HEADS)
@@ -208,7 +205,8 @@ class _CoreAttention(torch.nn.Module):
         ### Apply an attention mask to attention_scores.
 
         # attention scores and attention mask [b, np, sq, sk]
-        attention_probs = self.softmax(attention_scores)
+        with _Timer("softmax"):
+            attention_probs = self.softmax(attention_scores)
 
         # This is actually dropping out entire tokens to attend to, which might
         # seem a bit unusual, but is taken from the original Transformer paper.
@@ -227,15 +225,17 @@ class _CoreAttention(torch.nn.Module):
         # change view [sk, b * np, hn]
         value_layer = value_layer.view(value_layer.size(0), output_size[0] * output_size[1], -1)
         # dequantize value_layer
-        vmin = einops.rearrange(vmin, "s b h v -> s (b h) v")
-        vscale = einops.rearrange(vscale, "s b h v -> s (b h) v")
-        value_layer = vscale * value_layer + vmin
+        with _Timer("dequantize_V"):
+            vmin = einops.rearrange(vmin, "s b h v -> s (b h) v")
+            vscale = einops.rearrange(vscale, "s b h v -> s (b h) v")
+            value_layer = vscale * value_layer + vmin
 
         # change view [b * np, sq, sk]
         attention_probs = attention_probs.view(output_size[0] * output_size[1], output_size[2], -1)
 
         # matmul: [b * np, sq, hn]
-        context_layer = torch.bmm(attention_probs, value_layer.transpose(0, 1))
+        with _Timer("prob*V"):
+            context_layer = torch.bmm(attention_probs, value_layer.transpose(0, 1))
 
         # change view [b, np, sq, hn]
         context_layer = context_layer.view(*output_size)
@@ -352,29 +352,33 @@ class _DistributedAttention(torch.nn.Module):
         # TODO Merge three alltoall calls into one
         # in shape : e.g.,  [s/p:h:]
         # The current shape is [seq, batch, head, head_dim].
-        query_layer = _SeqAllToAll.apply(query, self.scatter_idx, self.gather_idx, num_tokens_list)
-        key_layer = _SeqAllToAll.apply(key, self.scatter_idx, self.gather_idx, seq_len_list)
-        value_layer = _SeqAllToAll.apply(value, self.scatter_idx, self.gather_idx, seq_len_list)
+        with _Timer("1st_a2a"):
+            query_layer = _SeqAllToAll.apply(query, self.scatter_idx, self.gather_idx, num_tokens_list)
+            key_layer = _SeqAllToAll.apply(key, self.scatter_idx, self.gather_idx, seq_len_list)
+            value_layer = _SeqAllToAll.apply(value, self.scatter_idx, self.gather_idx, seq_len_list)
 
-        q_min_scale = _SeqAllToAll.apply(q_min_scale, self.scatter_idx, self.gather_idx, num_tokens_list)
-        kv_min_scale = _SeqAllToAll.apply(kv_min_scale, self.scatter_idx, self.gather_idx, seq_len_list)
-        qmin, qscale = torch.tensor_split(q_min_scale, 2, dim=-1)
-        kmin, kscale, vmin, vscale = torch.tensor_split(kv_min_scale, 4, dim=-1)
+        with _Timer("1st_a2a_meta"):
+            q_min_scale = _SeqAllToAll.apply(q_min_scale, self.scatter_idx, self.gather_idx, num_tokens_list)
+            kv_min_scale = _SeqAllToAll.apply(kv_min_scale, self.scatter_idx, self.gather_idx, seq_len_list)
+            qmin, qscale = torch.tensor_split(q_min_scale, 2, dim=-1)
+            kmin, kscale, vmin, vscale = torch.tensor_split(kv_min_scale, 4, dim=-1)
 
-        q1 = query_layer >> 4
-        q2 = query_layer << 4 >> 4
-        query_layer = torch.cat([q1, q2], dim=-1)
-        k1 = key_layer >> 4
-        k2 = key_layer << 4 >> 4
-        key_layer = torch.cat([k1, k2], dim=-1)
-        v1 = value_layer >> 4
-        v2 = value_layer << 4 >> 4
-        value_layer = torch.cat([v1, v2], dim=-1)
+        with _Timer("unpack_QKV"):
+            q1 = query_layer >> 4
+            q2 = query_layer << 4 >> 4
+            query_layer = torch.cat([q1, q2], dim=-1)
+            k1 = key_layer >> 4
+            k2 = key_layer << 4 >> 4
+            key_layer = torch.cat([k1, k2], dim=-1)
+            v1 = value_layer >> 4
+            v2 = value_layer << 4 >> 4
+            value_layer = torch.cat([v1, v2], dim=-1)
 
         # out shape : e.g., [s:h/p:]
         context_layer = self.core_attn(query_layer, key_layer, value_layer, (qmin, qscale, kmin, kscale, vmin, vscale))
 
-        output = _SeqAllToAll.apply(context_layer, self.gather_idx, self.scatter_idx, num_tokens_list, False)
+        with _Timer("2nd_a2a"):
+            output = _SeqAllToAll.apply(context_layer, self.gather_idx, self.scatter_idx, num_tokens_list, False)
 
         # out e.g., [s/p::h]
         return output
@@ -1199,4 +1203,4 @@ if __name__ == "__main__":
                 node_conn.send(node_cmds)
                 node_conn.close()
             text_generation = TextGeneration()
-            text_generation.run(["how " * 4000], 1)
+            text_generation.run(["how " * 8189], 1)

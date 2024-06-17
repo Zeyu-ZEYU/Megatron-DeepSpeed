@@ -57,7 +57,7 @@ typedef const unsigned int cuint;
 __global__ void bmm_uint8_kernel(const uint8_t *A, const uint8_t *B, int *C,
                                  cuint batch_size, cuint M, cuint N, cuint K)
 {
-    extern __shared__ uint8_t shmem[][UINT8_K_TILE_CHUNK_PADDED_LEN];
+    extern __shared__ uint8_t shmem_uint8[][UINT8_K_TILE_CHUNK_PADDED_LEN];
     const int4 zero_mem = make_int4(0, 0, 0, 0);
 
     // Warp and lane identification.
@@ -76,7 +76,7 @@ __global__ void bmm_uint8_kernel(const uint8_t *A, const uint8_t *B, int *C,
     shmem_idx_for_ab += warpThreadId;
 
     // This pointer is used to access the C matrix tiles this warp computes.
-    int *shmem_ptr_c_warp = (int *)&shmem[0][0] +
+    int *shmem_ptr_c_warp = (int *)&shmem_uint8[0][0] +
                             (warpId / 2) * SHMEM_STRIDE_FOR_C * 16 * 2 +
                             (warpId % 2) * SHMEM_OFFSET_FOR_C;
     // Used for loading C from the shared memory to the global memory.
@@ -172,7 +172,7 @@ __global__ void bmm_uint8_kernel(const uint8_t *A, const uint8_t *B, int *C,
 #pragma unroll
             for (int i = 0; i < UINT8_K_CHUNK_TILES * 16 * 1 / 16; i++)
             {
-                *((int4 *)&shmem[shmem_idx_for_ab][0] + i) = *gmem_ab_ptr;
+                *((int4 *)&shmem_uint8[shmem_idx_for_ab][0] + i) = *gmem_ab_ptr;
 
                 gmem_ab_ptr += gmem_ab_ptr_step_len;
             }
@@ -189,7 +189,7 @@ __global__ void bmm_uint8_kernel(const uint8_t *A, const uint8_t *B, int *C,
                 for (int i = 0; i < 2; i++)
                 {
                     size_t shmem_idx_a = (warpId / 2) * 16 * 2 + (i * 16);
-                    const uint8_t *tile_ptr = &shmem[shmem_idx_a][k_step * 16];
+                    const uint8_t *tile_ptr = &shmem_uint8[shmem_idx_a][k_step * 16];
 
                     wmma::load_matrix_sync(a_frag[i], tile_ptr, UINT8_K_TILE_CHUNK_PADDED_LEN);
 
@@ -203,7 +203,7 @@ __global__ void bmm_uint8_kernel(const uint8_t *A, const uint8_t *B, int *C,
                             size_t shmem_idx_b = 128 +
                                                  (4 * 16) * (warpId % 2) +
                                                  (j * 16);
-                            const uint8_t *tile_ptr = &shmem[shmem_idx_b][k_step * 16];
+                            const uint8_t *tile_ptr = &shmem_uint8[shmem_idx_b][k_step * 16];
 
                             wmma::load_matrix_sync(b_frag[j], tile_ptr, UINT8_K_TILE_CHUNK_PADDED_LEN);
                         }
@@ -229,58 +229,58 @@ __global__ void bmm_uint8_kernel(const uint8_t *A, const uint8_t *B, int *C,
         }
         __syncthreads();
 
-        // // Now that shared memory contains all the C tiles, stream them to global
-        // // memory.
-        // int is_working_thread = 1;
-        // if (exceed_col_boundry)
-        // {
-        //     int block_tail_lines = 128 - (max_col_blocks_per_batch * 128 - M);
-        //     int warp_thread_block_line_id = (threadIdx.x / 64) * 32 + threadIdx.x % 32;
-        //     if (warp_thread_block_line_id >= block_tail_lines)
-        //         is_working_thread = 0;
-        // }
-        // // Default is (64 * sizeof(int) / 16).
-        // int int4_copy_count = 16;
-        // int single_value_copy_count = 0;
-        // if (is_working_thread && exceed_row_boundry)
-        // {
-        //     int block_tail_lines = 128 - (max_row_blocks * 128 - N);
-        //     if (block_tail_lines < 64)
-        //     {
-        //         if (warpId % 2 == 0)
-        //         {
-        //             int4_copy_count = block_tail_lines * sizeof(int) / 16;
-        //             single_value_copy_count = block_tail_lines - int4_copy_count * 16 / sizeof(int);
-        //         }
-        //         else
-        //             int4_copy_count = 0;
-        //     }
-        //     else
-        //     {
-        //         if (warpId % 2 == 1)
-        //         {
-        //             int4_copy_count = (block_tail_lines - 64) * sizeof(int) / 16;
-        //             single_value_copy_count = (block_tail_lines - 64) - int4_copy_count * 16 / sizeof(int);
-        //         }
-        //     }
-        // }
-        // const size_t gmem_idx_for_c = blk_glob_c_idx_i * N + blk_glob_c_idx_j +
-        //                               (warpId / 2) * 32 * N + (warpId % 2) * 64 + warpThreadId * N;
-        // if (is_working_thread)
-        // {
-        //     int *dst_gmem_ptr_c_thread = &C[gmem_idx_for_c];
-        //     for (int i = 0; i < int4_copy_count; i++)
-        //     {
-        //         *((int4 *)dst_gmem_ptr_c_thread + i) = *((int4 *)shmem_ptr_c_thread + i);
-        //     }
-        //     int *shmem_ptr_for_singv = shmem_ptr_c_thread + int4_copy_count * 16 / sizeof(int);
-        //     int *dst_gmem_ptr_for_singv = dst_gmem_ptr_c_thread + int4_copy_count * 16 / sizeof(int);
-        //     for (int i = 0; i < single_value_copy_count; i++)
-        //     {
-        //         *(dst_gmem_ptr_for_singv + i) = *(shmem_ptr_for_singv + i);
-        //     }
-        // }
-        // __syncthreads();
+        // Now that shared memory contains all the C tiles, stream them to global
+        // memory.
+        int is_working_thread = 1;
+        if (exceed_col_boundry)
+        {
+            int block_tail_lines = 128 - (max_col_blocks_per_batch * 128 - M);
+            int warp_thread_block_line_id = (threadIdx.x / 64) * 32 + threadIdx.x % 32;
+            if (warp_thread_block_line_id >= block_tail_lines)
+                is_working_thread = 0;
+        }
+        // Default is (64 * sizeof(int) / 16).
+        int int4_copy_count = 16;
+        int single_value_copy_count = 0;
+        if (is_working_thread && exceed_row_boundry)
+        {
+            int block_tail_lines = 128 - (max_row_blocks * 128 - N);
+            if (block_tail_lines < 64)
+            {
+                if (warpId % 2 == 0)
+                {
+                    int4_copy_count = block_tail_lines * sizeof(int) / 16;
+                    single_value_copy_count = block_tail_lines - int4_copy_count * 16 / sizeof(int);
+                }
+                else
+                    int4_copy_count = 0;
+            }
+            else
+            {
+                if (warpId % 2 == 1)
+                {
+                    int4_copy_count = (block_tail_lines - 64) * sizeof(int) / 16;
+                    single_value_copy_count = (block_tail_lines - 64) - int4_copy_count * 16 / sizeof(int);
+                }
+            }
+        }
+        const size_t gmem_idx_for_c = blk_glob_c_idx_i * N + blk_glob_c_idx_j +
+                                      (warpId / 2) * 32 * N + (warpId % 2) * 64 + warpThreadId * N;
+        if (is_working_thread)
+        {
+            int *dst_gmem_ptr_c_thread = &C[gmem_idx_for_c];
+            for (int i = 0; i < int4_copy_count; i++)
+            {
+                *((int4 *)dst_gmem_ptr_c_thread + i) = *((int4 *)shmem_ptr_c_thread + i);
+            }
+            int *shmem_ptr_for_singv = shmem_ptr_c_thread + int4_copy_count * 16 / sizeof(int);
+            int *dst_gmem_ptr_for_singv = dst_gmem_ptr_c_thread + int4_copy_count * 16 / sizeof(int);
+            for (int i = 0; i < single_value_copy_count; i++)
+            {
+                *(dst_gmem_ptr_for_singv + i) = *(shmem_ptr_for_singv + i);
+            }
+        }
+        __syncthreads();
 
         // Update the indices of the block in the C matrix.
         block_id += num_blocks;
