@@ -56,7 +56,7 @@ torch::Tensor bmm_half(torch::Tensor A, torch::Tensor B)
     return C;
 }
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, py_module)
 {
-    m.def("call", &bmm_half, "Tiled batch matrix multiplication for half precision with CUDA");
+    py_module.def("call", &bmm_half, "Tiled batch matrix multiplication for half precision with CUDA.");
 }

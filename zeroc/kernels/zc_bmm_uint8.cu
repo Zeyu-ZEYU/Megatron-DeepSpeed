@@ -55,7 +55,7 @@ torch::Tensor bmm_uint8(torch::Tensor A, torch::Tensor B)
     return C;
 }
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, py_module)
 {
-    m.def("call", &bmm_uint8, "Tiled batch matrix multiplication for uint8_t with CUDA");
+    py_module.def("call", &bmm_uint8, "Tiled batch matrix multiplication for uint8_t with CUDA.");
 }

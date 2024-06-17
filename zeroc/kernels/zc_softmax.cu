@@ -52,5 +52,5 @@ torch::Tensor softmax(torch::Tensor input)
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, py_module)
 {
-    py_module.def("call", &softmax, "Custom Softmax");
+    py_module.def("call", &softmax, "Custom softmax.");
 }

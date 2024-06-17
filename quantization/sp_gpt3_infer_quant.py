@@ -10,7 +10,6 @@ import einops
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
-import zc_bmm_uint8
 
 # from apex.normalization.fused_layer_norm import MixedFusedLayerNorm
 # from flash_attn.flash_attn_interface import flash_attn_varlen_func
@@ -24,20 +23,39 @@ from megatron.core.utils import divide
 from megatron.model.fused_bias_gelu import bias_gelu_impl
 from zutils import net as znet
 
-GENERATION_SERVER_IP = "10.155.48.72"
+# import zc_bmm_uint8
+
+
+# GENERATION_SERVER_IP = "10.155.48.71"
+# GENERATION_SERVER_PORT = 43211
+# MODEL_IPS = [GENERATION_SERVER_IP, "10.155.48.70", "10.155.48.73", "10.155.48.76"]
+# MODEL_GPUS = [[0], [0], [0], [0]]
+# CMD_SERVER_PORT = 34119
+# NCCL_MASTER_PORT = 43214
+# CODE_NAME_FOR_SHELL = "sp_gpt3_infer_quant.py"
+# CODE_PATH_FOR_SHELL = "/home/qxc4fh/zeyu/Megatron-DeepSpeed/quantization"
+
+
+# # Inference config
+# CONFIG = {}
+# CONFIG["param_path"] = "/home/qxc4fh/zeyu/large_files/gpt_params.pkl"
+# CONFIG["tokenizer_path"] = "/home/qxc4fh/zeyu/Megatron-DeepSpeed/gpt3_infer/gpt_tokenizer_kernel.pkl"
+
+
+GENERATION_SERVER_IP = "192.168.0.3"
 GENERATION_SERVER_PORT = 43211
-MODEL_IPS = [GENERATION_SERVER_IP, "10.155.48.73", "10.155.48.68", "10.155.48.66"]
-MODEL_GPUS = [[0], [0], [0], [0]]
+MODEL_IPS = [GENERATION_SERVER_IP, "192.168.0.4"]
+MODEL_GPUS = [[0], [0]]
 CMD_SERVER_PORT = 34119
-NCCL_MASTER_PORT = 43214
+NCCL_MASTER_PORT = 43614
 CODE_NAME_FOR_SHELL = "sp_gpt3_infer_quant.py"
-CODE_PATH_FOR_SHELL = "/home/qxc4fh/zeyu/Megatron-DeepSpeed/quantization"
+CODE_PATH_FOR_SHELL = "/home/zeyu/Megatron-DeepSpeed/quantization"
 
 
 # Inference config
 CONFIG = {}
-CONFIG["param_path"] = "/home/qxc4fh/zeyu/large_files/gpt_params.pkl"
-CONFIG["tokenizer_path"] = "/home/qxc4fh/zeyu/Megatron-DeepSpeed/gpt3_infer/gpt_tokenizer_kernel.pkl"
+CONFIG["param_path"] = "/home/zeyu/large_files/gpt_params.pkl"
+CONFIG["tokenizer_path"] = "/home/zeyu/Megatron-DeepSpeed/gpt3_infer/gpt_tokenizer_kernel.pkl"
 
 
 CONTEXT_LEN = 2048
@@ -156,10 +174,16 @@ class _CoreAttention(torch.nn.Module):
         # Raw attention scores. [b * np, sq, sk]
         q_input = query_layer.transpose(0, 1)  # [b * np, sq, hn]
         k_input = key_layer.transpose(0, 1).transpose(1, 2)  # [b * np, hn, sk]
-        matmul_result = zc_bmm_uint8.call(
-            q_input,  # [b * np, sq, hn]
-            k_input,  # [b * np, hn, sk]
-        )
+        q_input = q_input.to(torch.int8)
+        k_input = k_input.to(torch.int8)
+
+        print(q_input.shape)
+        print(k_input.shape)
+        with _Timer("Matrix"):
+            matmul_result = torch.bmm(
+                q_input,  # [b * np, sq, hn]
+                k_input,  # [b * np, hn, sk]
+            )
 
         # <aX + b, cY + d> = ac<X, Y> + ad*sum(X) + bc*sum(Y) + bdn, where n=128
         # a=qscale, b=qmin, c=kscale, d=kmin
@@ -1175,4 +1199,4 @@ if __name__ == "__main__":
                 node_conn.send(node_cmds)
                 node_conn.close()
             text_generation = TextGeneration()
-            text_generation.run(["How big is the universe?"], 100)
+            text_generation.run(["how " * 4000], 1)

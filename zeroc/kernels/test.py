@@ -56,32 +56,64 @@ b = torch.tensor(
 )
 
 
-a = torch.rand(
+a = torch.randint(
+    -10,
+    10,
     [4, 8192, 128],
     dtype=torch.float16,
     device="cuda:0",
 )
-b = torch.rand(
+b = torch.randint(
+    -10,
+    10,
     [4, 128, 8192],
     dtype=torch.float16,
     device="cuda:0",
 )
-int_a = torch.rand(
+c = torch.randint(
+    -10,
+    10,
+    [4, 8192, 128],
+    dtype=torch.float16,
+    device="cuda:0",
+)
+d = torch.randint(
+    -10,
+    10,
+    [4, 128, 8192],
+    dtype=torch.float16,
+    device="cuda:0",
+)
+int_a = torch.randint(
+    -10,
+    10,
     [4, 8192, 128],
     dtype=torch.float16,
     device="cuda:0",
 ).to(torch.uint8)
-int_b = torch.rand(
+int_b = torch.randint(
+    -10,
+    10,
     [4, 128, 8192],
     dtype=torch.float16,
     device="cuda:0",
 ).to(torch.uint8)
+
 
 with _Timer("fp16"):
     fp16 = zc_bmm_half.call(a, b)
 
+with _Timer("fp16 2"):
+    fp16 = zc_bmm_half.call(a, b)
+
 with _Timer("torch fp16"):
     t_fp16 = torch.bmm(a, b)
+
+with _Timer("torch fp16 2"):
+    t_fp16 = torch.bmm(c, d)
+
+with _Timer("torch fp16 3"):
+    t_fp16 = torch.bmm(c, d)
 
 with _Timer("uint8"):
     uint8 = zc_bmm_uint8.call(int_a, int_b)
