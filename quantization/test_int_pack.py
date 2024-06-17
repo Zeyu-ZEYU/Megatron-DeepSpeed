@@ -3,21 +3,21 @@ import time
 import numpy as np
 import torch
 
-# 创建两个整数类型的矩阵
-a = torch.tensor([[1, 2], [3, 4]], dtype=torch.int8)
-b = torch.tensor([[5, 6], [7, 8]], dtype=torch.int8)
+# # 创建两个整数类型的矩阵
+# a = torch.tensor([[1, 2], [3, 4]], dtype=torch.int8)
+# b = torch.tensor([[5, 6], [7, 8]], dtype=torch.int8)
 
-# 矩阵乘法
-c = torch.matmul(a, b)
+# # 矩阵乘法
+# c = torch.matmul(a, b)
 
-print(c)
-
-
-exit()
+# print(c)
 
 
-def uint64(num):
-    return torch.tensor(num, dtype=torch.uint16, device="cuda:0")
+# exit()
+
+
+# def uint64(num):
+#     return torch.tensor(num, dtype=torch.uint16, device="cuda:0")
 
 
 # x1, x2, x3, x4 = (uint64(127), uint64(33), uint64(4), uint64(11))
@@ -49,34 +49,39 @@ def uint64(num):
 
 # print(1000 * (t2 - t1))
 
-dtype = np.uint64
-x1 = np.array([127], dtype=dtype)
-x2 = np.array([33], dtype=dtype)
-x3 = np.array([4], dtype=dtype)
-x4 = np.array([11], dtype=dtype)
-y1 = np.array([173], dtype=dtype)
-y2 = np.array([7], dtype=dtype)
-y3 = np.array([21], dtype=dtype)
-y4 = np.array([22], dtype=dtype)
+dtype = np.uint32
+x1 = np.array([2], dtype=dtype)
+x2 = np.array([4], dtype=dtype)
+x3 = np.array([3], dtype=dtype)
+x4 = np.array([3], dtype=dtype)
 
-X13 = (x1 << 24) | (x3 << 8)
-X24 = (x2 << 16) | x4
+x13 = (x1 << 4) | x3
+x24 = (x2 << 4) | x4
 
-Y13 = (y1 << 24) | (y3 << 8)
-Y24 = (y2 << 16) | y4
 
-mask1 = np.array([0xFFFF0000FFFF0000], dtype=dtype)
-mask2 = np.array([0x0000FFFF0000FFFF], dtype=dtype)
-res = ((X13 * Y13) & mask1) | (X24 * Y24 & mask2)
+# X13 = (x1 << 24) | (x3 << 8)
+# X24 = (x2 << 16) | x4
 
-print(x1 * y1)
-print(res >> 48)
-print(x2 * y2)
-print(res << 16 >> 48)
-print(x3 * y3)
-print(res << 32 >> 48)
-print(x4 * y4)
-print(res << 48 >> 48)
+# Y13 = (y1 << 24) | (y3 << 8)
+# Y24 = (y2 << 16) | y4
+m = x13 * x24
+
+print(np.binary_repr(x13[0], width=32))
+print(np.binary_repr(x24[0], width=32))
+print(np.binary_repr(m[0], width=32))
+
+# mask1 = np.array([0xFFFF0000FFFF0000], dtype=dtype)
+# mask2 = np.array([0x0000FFFF0000FFFF], dtype=dtype)
+# res = ((X13 * Y13) & mask1) | (X24 * Y24 & mask2)
+
+# print(x1 * y1)
+# print(res >> 48)
+# print(x2 * y2)
+# print(res << 16 >> 48)
+# print(x3 * y3)
+# print(res << 32 >> 48)
+# print(x4 * y4)
+# print(res << 48 >> 48)
 
 
 # f = np.array((127, 33, 4, 11), dtype=np.uint64)

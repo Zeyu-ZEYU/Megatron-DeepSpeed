@@ -2,11 +2,10 @@
 
 int main()
 {
-    int a = -4;
-    unsigned int b = 10;
+    unsigned char a = 3;
+    unsigned char b = 4;
 
-    if (a < b)
     {
-        printf("ddddd\n");
+        printf("ddddd%d\n", a * b);
     }
 }

@@ -11,6 +11,12 @@ setup(
             ],
         ),
         CUDAExtension(
+            "zc_blas_uint8",
+            [
+                "zc_blas_uint8.cu",
+            ],
+        ),
+        CUDAExtension(
             "zc_bmm_half",
             [
                 "zc_bmm_half.cu",
