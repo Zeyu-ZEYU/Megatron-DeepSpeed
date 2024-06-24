@@ -170,16 +170,17 @@ class _CoreAttention(torch.nn.Module):
         key_layer = key_layer.view(output_size[3], output_size[0] * output_size[1], -1)
 
         # Raw attention scores. [b * np, sq, sk]
-        q_input = query_layer.transpose(0, 1)  # [b * np, sq, hn]
-        k_input = key_layer.transpose(0, 1)  # [b * np, sk, hn]
+        q_input = query_layer.transpose(0, 1).to(torch.float32)  # [b * np, sq, hn]
+        k_input = key_layer.transpose(0, 1).transpose(1, 2).to(torch.float32)  # [b * np, hn, sk]
+        print(f"q_input.dtype: {q_input.dtype}")
         with _Timer("QK_matmul"):
-            matmul_result = zc_blas.bmm_uint8(
+            matmul_result = torch.bmm(
                 q_input,  # [b * np, sq, hn]
                 k_input,  # [b * np, hn, sk]
             )
 
-        with _Timer("QK_to_uint16"):
-            matmul_result = matmul_result.to(torch.uint16)
+        with _Timer("QK_to_int16"):
+            matmul_result = matmul_result.to(torch.int16)
 
         # <aX + b, cY + d> = ac<X, Y> + ad*sum(X) + bc*sum(Y) + bdn, where n=128
         # a=qscale, b=qmin, c=kscale, d=kmin
@@ -187,19 +188,20 @@ class _CoreAttention(torch.nn.Module):
         qscale = einops.rearrange(qscale, "s b h v -> (b h) s v")
         kmin = einops.rearrange(kmin, "s b h v -> (b h) v s")
         kscale = einops.rearrange(kscale, "s b h v -> (b h) v s")
+        print(f"kmin.dtype: {kmin.dtype}")
         with _Timer("recover_QK"):
             attention_scores = (
-                torch.bmm(qscale, kscale) * matmul_result
-                + torch.bmm(qscale * torch.sum(q_input, dim=-1, keepdim=True), kmin)
-                + torch.bmm(qmin, kscale * torch.sum(k_input, dim=-2, keepdim=True))
+                (torch.bmm(qscale, kscale) * matmul_result).to(torch.float16)
+                + torch.bmm((qscale * torch.sum(q_input, dim=-1, keepdim=True)).to(torch.float16), kmin)
+                + torch.bmm(qmin, (kscale * torch.sum(k_input, dim=-2, keepdim=True)).to(torch.float16))
                 + HIDDEN_SIZE / NUM_HEADS * torch.bmm(qmin, kmin)
             )
 
         # apply the scaling factor of attention socres
-        matmul_result /= math.sqrt(HIDDEN_SIZE % NUM_HEADS)
+        attention_scores /= math.sqrt(HIDDEN_SIZE % NUM_HEADS)
 
         # change view to [b, np, sq, sk]
-        attention_scores = matmul_result.view(*output_size)
+        attention_scores = attention_scores.view(*output_size)
 
         ### TODO:
         ### Apply an attention mask to attention_scores.
