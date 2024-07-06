@@ -10,7 +10,6 @@
 
 import torch
 
-a = torch.ones([2, 2], dtype=torch.int8, device="cuda:0")
-b = torch.ones([2, 2], dtype=torch.int8, device="cuda:0")
+M = torch.tril(torch.ones((6, 6), device="cuda"))
 
-torch.matmul(a, b)
+print(hasattr(torch, "float8_e5m2"))

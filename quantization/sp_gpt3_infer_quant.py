@@ -10,7 +10,6 @@ import einops
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
-import zc_blas
 
 # from apex.normalization.fused_layer_norm import MixedFusedLayerNorm
 # from flash_attn.flash_attn_interface import flash_attn_varlen_func
@@ -24,36 +23,39 @@ from megatron.core.utils import divide
 from megatron.model.fused_bias_gelu import bias_gelu_impl
 from zutils import net as znet
 
-GENERATION_SERVER_IP = "10.155.48.70"
-GENERATION_SERVER_PORT = 43211
-MODEL_IPS = [GENERATION_SERVER_IP, "10.155.48.76", "10.155.48.75", "10.155.48.73"]
-MODEL_GPUS = [[0], [0], [0], [0]]
-CMD_SERVER_PORT = 34119
-NCCL_MASTER_PORT = 43214
-CODE_NAME_FOR_SHELL = "sp_gpt3_infer_quant.py"
-CODE_PATH_FOR_SHELL = "/home/qxc4fh/zeyu/Megatron-DeepSpeed/quantization"
+# import zc_blas
 
 
-# Inference config
-CONFIG = {}
-CONFIG["param_path"] = "/home/qxc4fh/zeyu/large_files/gpt_params.pkl"
-CONFIG["tokenizer_path"] = "/home/qxc4fh/zeyu/Megatron-DeepSpeed/gpt3_infer/gpt_tokenizer_kernel.pkl"
-
-
-# GENERATION_SERVER_IP = "192.168.0.3"
+# GENERATION_SERVER_IP = "10.155.48.70"
 # GENERATION_SERVER_PORT = 43211
-# MODEL_IPS = [GENERATION_SERVER_IP, "192.168.0.4"]
-# MODEL_GPUS = [[0], [0]]
+# MODEL_IPS = [GENERATION_SERVER_IP, "10.155.48.76", "10.155.48.75", "10.155.48.73"]
+# MODEL_GPUS = [[0], [0], [0], [0]]
 # CMD_SERVER_PORT = 34119
-# NCCL_MASTER_PORT = 43614
+# NCCL_MASTER_PORT = 43214
 # CODE_NAME_FOR_SHELL = "sp_gpt3_infer_quant.py"
-# CODE_PATH_FOR_SHELL = "/home/zeyu/Megatron-DeepSpeed/quantization"
+# CODE_PATH_FOR_SHELL = "/home/qxc4fh/zeyu/Megatron-DeepSpeed/quantization"
 
 
 # # Inference config
 # CONFIG = {}
-# CONFIG["param_path"] = "/home/zeyu/large_files/gpt_params.pkl"
-# CONFIG["tokenizer_path"] = "/home/zeyu/Megatron-DeepSpeed/gpt3_infer/gpt_tokenizer_kernel.pkl"
+# CONFIG["param_path"] = "/home/qxc4fh/zeyu/large_files/gpt_params.pkl"
+# CONFIG["tokenizer_path"] = "/home/qxc4fh/zeyu/Megatron-DeepSpeed/gpt3_infer/gpt_tokenizer_kernel.pkl"
+
+
+GENERATION_SERVER_IP = "192.168.0.2"
+GENERATION_SERVER_PORT = 43211
+MODEL_IPS = [GENERATION_SERVER_IP, "192.168.0.3"]
+MODEL_GPUS = [[0], [0]]
+CMD_SERVER_PORT = 34119
+NCCL_MASTER_PORT = 43614
+CODE_NAME_FOR_SHELL = "sp_gpt3_infer_quant.py"
+CODE_PATH_FOR_SHELL = "/home/zeyu/Megatron-DeepSpeed/quantization"
+
+
+# Inference config
+CONFIG = {}
+CONFIG["param_path"] = "/home/zeyu/large_files/gpt_params.pkl"
+CONFIG["tokenizer_path"] = "/home/zeyu/Megatron-DeepSpeed/gpt3_infer/gpt_tokenizer_kernel.pkl"
 
 
 CONTEXT_LEN = 2048
@@ -234,6 +236,21 @@ class _CoreAttention(torch.nn.Module):
 
         # change view [b * np, sq, sk]
         attention_probs = attention_probs.view(output_size[0] * output_size[1], output_size[2], -1)
+
+        with _Timer("quantize_attn_prob"):
+            window = attention_probs.unfold(2, 128, 128)
+            max_values = window.max(dim=3).values
+            min_values = window.min(dim=3).values
+            if attention_probs.size(2) % 128 != 0:
+                remaining = attention_probs[:, :, -attention_probs.size(2) % 128 :]
+                max_values_remaining = remaining.max(dim=2).values.unsqueeze(2)
+                min_values_remaining = remaining.min(dim=2).values.unsqueeze(2)
+                max_values = torch.cat((max_values, max_values_remaining), dim=2)
+                min_values = torch.cat((min_values, min_values_remaining), dim=2)
+            scale_values = (max_values - min_values) / 16
+            # attention_probs_quant = ((attention_probs - min_values + scale_values / 2) / scale_values).to(torch.uint8)
+
+        # attention_probs_quant = attention_probs_quant.to(torch.float16)
 
         # matmul: [b * np, sq, hn]
         with _Timer("prob*V"):
@@ -504,39 +521,40 @@ class Attention(torch.nn.Module):
         (query_layer, key_layer, value_layer) = split_tensor_along_last_dim(mixed_x_layer, 3)
 
         # Quantization
-        quant_qmax = torch.max(query_layer, dim=3, keepdim=True).values
-        quant_qmin = torch.min(query_layer, dim=3, keepdim=True).values
-        quant_qscaling = (quant_qmax - quant_qmin) / 16
-        quant_kmax = torch.max(key_layer, dim=3, keepdim=True).values
-        quant_kmin = torch.min(key_layer, dim=3, keepdim=True).values
-        quant_kscaling = (quant_kmax - quant_kmin) / 16
-        quant_vmax = torch.max(value_layer, dim=3, keepdim=True).values
-        quant_vmin = torch.min(value_layer, dim=3, keepdim=True).values
-        quant_vscaling = (quant_vmax - quant_vmin) / 16
-        if self.quant_kmin is None:
-            self.quant_kmin = quant_kmin
-            self.quant_kscaling = quant_kscaling
-            self.quant_vmin = quant_vmin
-            self.quant_vscaling = quant_vscaling
-        else:
-            self.quant_kmin = torch.cat((self.quant_kmin, quant_kmin), dim=0)
-            self.quant_kscaling = torch.cat((self.quant_kscaling, quant_kscaling), dim=0)
-            self.quant_vmin = torch.cat((self.quant_vmin, quant_vmin), dim=0)
-            self.quant_vscaling = torch.cat((self.quant_vscaling, quant_vscaling), dim=0)
-        query_layer = ((query_layer - quant_qmin + quant_qscaling / 2) / quant_qscaling).to(torch.uint8)
-        key_layer = ((key_layer - quant_kmin + quant_kscaling / 2) / quant_kscaling).to(torch.uint8)
-        value_layer = ((value_layer - quant_vmin + quant_vscaling / 2) / quant_vscaling).to(torch.uint8)
+        with _Timer("quantize_QKV"):
+            quant_qmax = torch.max(query_layer, dim=3, keepdim=True).values
+            quant_qmin = torch.min(query_layer, dim=3, keepdim=True).values
+            quant_qscaling = (quant_qmax - quant_qmin) / 16
+            quant_kmax = torch.max(key_layer, dim=3, keepdim=True).values
+            quant_kmin = torch.min(key_layer, dim=3, keepdim=True).values
+            quant_kscaling = (quant_kmax - quant_kmin) / 16
+            quant_vmax = torch.max(value_layer, dim=3, keepdim=True).values
+            quant_vmin = torch.min(value_layer, dim=3, keepdim=True).values
+            quant_vscaling = (quant_vmax - quant_vmin) / 16
+            if self.quant_kmin is None:
+                self.quant_kmin = quant_kmin
+                self.quant_kscaling = quant_kscaling
+                self.quant_vmin = quant_vmin
+                self.quant_vscaling = quant_vscaling
+            else:
+                self.quant_kmin = torch.cat((self.quant_kmin, quant_kmin), dim=0)
+                self.quant_kscaling = torch.cat((self.quant_kscaling, quant_kscaling), dim=0)
+                self.quant_vmin = torch.cat((self.quant_vmin, quant_vmin), dim=0)
+                self.quant_vscaling = torch.cat((self.quant_vscaling, quant_vscaling), dim=0)
+            query_layer = ((query_layer - quant_qmin + quant_qscaling / 2) / quant_qscaling).to(torch.uint8)
+            key_layer = ((key_layer - quant_kmin + quant_kscaling / 2) / quant_kscaling).to(torch.uint8)
+            value_layer = ((value_layer - quant_vmin + quant_vscaling / 2) / quant_vscaling).to(torch.uint8)
 
-        # Pack two uint4 into one uint8
-        q1 = query_layer[..., 0:64] << 4
-        q2 = query_layer[..., 64:128]
-        query_layer = q1 + q2
-        k1 = key_layer[..., 0:64] << 4
-        k2 = key_layer[..., 64:128]
-        key_layer = k1 + k2
-        v1 = value_layer[..., 0:64] << 4
-        v2 = value_layer[..., 64:128]
-        value_layer = v1 + v2
+            # Pack two uint4 into one uint8
+            q1 = query_layer[..., 0:64] << 4
+            q2 = query_layer[..., 64:128]
+            query_layer = q1 + q2
+            k1 = key_layer[..., 0:64] << 4
+            k2 = key_layer[..., 64:128]
+            key_layer = k1 + k2
+            v1 = value_layer[..., 0:64] << 4
+            v2 = value_layer[..., 64:128]
+            value_layer = v1 + v2
 
         # ===================================================
         # Adjust key, value, and attention mask for inference
@@ -1205,4 +1223,4 @@ if __name__ == "__main__":
                 node_conn.send(node_cmds)
                 node_conn.close()
             text_generation = TextGeneration()
-            text_generation.run(["how " * 8189], 1)
+            text_generation.run(["how " * 4092], 1)
