@@ -248,11 +248,6 @@ def self_attention(q, k, v, causal, sm_scale):
     assert HEAD_DIM_K in {16, 32, 64, 128, 256}
     o = torch.empty_like(q)
     stage = 3 if causal else 1
-    extra_kern_args = {}
-    # Tuning for AMD target
-    if is_hip():
-        waves_per_eu = 3 if HEAD_DIM_K <= 64 else 2
-        extra_kern_args = {"waves_per_eu": waves_per_eu, "allow_flush_denorm": True}
 
     grid = lambda args: (triton.cdiv(q.shape[2], args["BLOCK_M"]), q.shape[0] * q.shape[1], 1)
     M = torch.empty((q.shape[0], q.shape[1], q.shape[2]), device=q.device, dtype=torch.float32)
@@ -284,7 +279,6 @@ def self_attention(q, k, v, causal, sm_scale):
         N_CTX=q.shape[2],  #
         HEAD_DIM=HEAD_DIM_K,  #
         STAGE=stage,  #
-        **extra_kern_args,
     )
 
     return o
