@@ -26,7 +26,7 @@ from zutils import net as znet
 GENERATION_SERVER_IP = "192.168.0.2"
 GENERATION_SERVER_PORT = 43211
 MODEL_IPS = [GENERATION_SERVER_IP, "192.168.0.3"]
-MODEL_GPUS = [[0], [0], [0], [0]]
+MODEL_GPUS = [[0], [0]]
 CMD_SERVER_PORT = 34119
 NCCL_MASTER_PORT = 43214
 CODE_NAME_FOR_SHELL = "infer_sp.py"
@@ -1109,5 +1109,7 @@ if __name__ == "__main__":
                 node_conn.close()
             text_generation = TextGeneration()
             # text_generation.run(["How big is the universe?"], 100)
-            text = ["how " for _ in range(3890)]
-            text_generation.run(["How big is the universe?"], 100)
+            text = "how "
+            for _ in range(3900):
+                text += "how "
+            text_generation.run([text], 3)

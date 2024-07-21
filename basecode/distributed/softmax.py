@@ -1,9 +1,31 @@
-import pycuda.autoinit
-import pycuda.driver as drv
 import torch
+import torch.multiprocessing as mp
 import triton
 import triton.language as tl
-from triton.runtime import driver
+
+
+def _cuda_info(info_queue):
+    import pycuda.autoinit
+    import pycuda.driver as drv
+    from triton.runtime import driver
+
+    properties = driver.utils.get_device_properties(0)
+    attributes = drv.Device(0).get_attributes()
+    NUM_SM = properties["multiprocessor_count"]
+    NUM_REGS = attributes[drv.device_attribute.MAX_REGISTERS_PER_MULTIPROCESSOR]
+    SIZE_SMEM = attributes[drv.device_attribute.MAX_SHARED_MEMORY_PER_MULTIPROCESSOR]
+    WARP_SIZE = attributes[drv.device_attribute.WARP_SIZE]
+
+    info_queue.put({"NUM_SM": NUM_SM, "NUM_REGS": NUM_REGS, "SIZE_SMEM": SIZE_SMEM, "WARP_SIZE": WARP_SIZE})
+
+
+_info_queue = mp.Queue()
+mp.Process(target=_cuda_info, args=(_info_queue,)).start()
+_cuinfo = _info_queue.get()
+NUM_SM = _cuinfo["NUM_SM"]
+NUM_REGS = _cuinfo["NUM_REGS"]
+SIZE_SMEM = _cuinfo["SIZE_SMEM"]
+WARP_SIZE = _cuinfo["WARP_SIZE"]
 
 
 @triton.jit
@@ -54,12 +76,6 @@ def softmax_kernel(
         tl.store(output_ptrs, softmax_output, mask=mask)
 
 
-properties = driver.utils.get_device_properties(0)
-attributes = drv.Device(0).get_attributes()
-NUM_SM = properties["multiprocessor_count"]
-NUM_REGS = attributes[drv.device_attribute.MAX_REGISTERS_PER_MULTIPROCESSOR]
-SIZE_SMEM = attributes[drv.device_attribute.MAX_SHARED_MEMORY_PER_MULTIPROCESSOR]
-WARP_SIZE = attributes[drv.device_attribute.WARP_SIZE]
 kernels = {}
 
 
