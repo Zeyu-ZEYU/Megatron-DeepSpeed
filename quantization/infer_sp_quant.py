@@ -29,8 +29,8 @@ MODEL_IPS = [GENERATION_SERVER_IP, "192.168.0.3"]
 MODEL_GPUS = [[0], [0]]
 CMD_SERVER_PORT = 34119
 NCCL_MASTER_PORT = 43214
-CODE_NAME_FOR_SHELL = "infer_sp.py"
-CODE_PATH_FOR_SHELL = "/home/zeyu/Megatron-DeepSpeed/basecode/distributed"
+CODE_NAME_FOR_SHELL = "infer_sp_quant.py"
+CODE_PATH_FOR_SHELL = "/home/zeyu/Megatron-DeepSpeed/quantization"
 
 
 # Inference config
@@ -123,9 +123,9 @@ class _CoreAttention(torch.nn.Module):
         qmin, qscale, kmin, kscale, vmin, vscale = quant_factors
 
         # [sq, b, np, hn] -> [sq, b * np, hn]
-        query_layer = einops.rearrange(query_layer, "s b h d -> b h s d")
+        query_layer = einops.rearrange(query_layer, "s b h d -> b h s d").to(torch.int8)
         # [sk, b, np, hn] -> [sk, b * np, hn]
-        key_layer = einops.rearrange(key_layer, "s b h d -> b h s d")
+        key_layer = einops.rearrange(key_layer, "s b h d -> b h s d").to(torch.int8)
 
         qmin = einops.rearrange(qmin.squeeze(3), "s b h -> b h s")
         qscale = einops.rearrange(qscale.squeeze(3), "s b h -> b h s")
@@ -136,7 +136,7 @@ class _CoreAttention(torch.nn.Module):
 
         quant_prob, pmin, pscale = softmaxq(attention_scores, 1 / math.sqrt(128), causal)
 
-        value_layer = einops.rearrange(value_layer, "s b h d -> b h s d")
+        value_layer = einops.rearrange(value_layer, "s b h d -> b h s d").to(torch.int8)
         vmin = einops.rearrange(vmin.squeeze(4), "g b h d -> b h g d")
         vscale = einops.rearrange(vscale.squeeze(4), "g b h d -> b h g d")
         attn_out = attnq_pv(quant_prob, value_layer, pscale, pmin, vscale, vmin)
