@@ -52,6 +52,19 @@ SYNTHETIC_PARAMS = True
 FLASH_ATTENTION = True
 
 
+CONTEXT_LEN = 2048
+HIDDEN_SIZE = 5120
+NUM_LAYERS = 40
+NUM_HEADS = 40
+MLP_HIDDEN_SIZE = 512 * 15
+VOCAB_SIZE = 50304
+assert HIDDEN_SIZE % NUM_HEADS == 0
+
+
+SYNTHETIC_PARAMS = True
+FLASH_ATTENTION = False
+
+
 class _VocabEmbedding(torch.nn.Module):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
