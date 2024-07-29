@@ -7,6 +7,7 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import transformers
+import transformers.models
 from datasets import Dataset
 from peft import LoraConfig, PeftConfig
 from sklearn.metrics import (
@@ -182,13 +183,12 @@ def predict(test, model, tokenizer):
 print(type(model.model.layers[2].self_attn))
 
 
-for n, p in model.named_parameters():
-    print(n, p.dtype, p.shape)
-exit()
+# for n, p in model.named_parameters():
+#     print(n, p.dtype, p.shape)
+# exit()
 
 y_pred = predict(test, model, tokenizer)
 evaluate(y_true, y_pred)
-
 
 # def compute_metrics(p):
 #     pred, labels = p

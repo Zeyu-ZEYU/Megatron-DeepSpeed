@@ -579,32 +579,68 @@ class ScaledDotProductAttention(nn.Module):
         # 通过softmax计算权重
         attention_weights = F.softmax(scores, dim=-1)
 
+        # rvalue = None
+        # if attention_weights.size(3) % 128 != 0:
+        #     remain = attention_weights[..., -(attention_weights.size(3) % 128):]
+        #     rmaxv = remain.max(dim=3, keepdim=True).values
+        #     rminv = remain.min(dim=3, keepdim=True).values
+        #     rscalev = (rmaxv - rminv) / 256
+        #     rquant = (remain - rminv) / rscalev
+        #     rquant = torch.where(torch.isnan(rquant), torch.zeros_like(rquant), rquant)
+        #     rquant = torch.round(rquant)
+        #     rvalue = rquant * rscalev + rminv
+        # if attention_weights.size(3) >= 128:
+        #     win = attention_weights.unfold(3, 128, 128)
+        #     maxv = win.max(dim=4, keepdim=True).values
+        #     minv = win.min(dim=4, keepdim=True).values
+        #     scalev = (maxv - minv) / 256
+        #     quant = (win - minv) / scalev
+        #     quant = torch.where(torch.isnan(quant), torch.zeros_like(quant), quant)
+        #     quant = torch.round(quant)
+        #     value = quant * scalev + minv
+        #     value = value.view(attention_weights.size(0), attention_weights.size(1), attention_weights.size(2), -1)
+        #     if rvalue is None:
+        #         rvalue = value
+        #     else:
+        #         rvalue = torch.cat([value, rvalue], dim=3)
+        # attention_weights = rvalue
+
         rvalue = None
         if attention_weights.size(3) % 128 != 0:
             remain = attention_weights[..., -(attention_weights.size(3) % 128) :]
             rmaxv = remain.max(dim=3, keepdim=True).values
-            rminv = remain.min(dim=3, keepdim=True).values
-            rscalev = (rmaxv - rminv) / 256
-            rquant = (remain - rminv) / rscalev
-            rquant = torch.where(torch.isnan(rquant), torch.zeros_like(rquant), rquant)
-            rquant = torch.round(rquant)
-            rvalue = rquant * rscalev + rminv
+            # rminv = remain.min(dim=3, keepdim=True).values
+            rabs = torch.abs(remain)
+            rsign = torch.sign(remain)
+            rlogmax = torch.log(rmaxv + 1)
+            rlogdata = torch.log(rabs + 1)
+            rnormdata = (rlogdata / rlogmax) * 255
+            rnormdata = torch.where(torch.isnan(rnormdata), torch.zeros_like(rnormdata), rnormdata)
+            rquant = torch.round(rnormdata)
+            rlogdata = rquant / 255 * rlogmax
+            rdataabs = torch.exp(rlogdata) - 1
+            data = rdataabs * rsign
+            rvalue = data
         if attention_weights.size(3) >= 128:
             win = attention_weights.unfold(3, 128, 128)
             maxv = win.max(dim=4, keepdim=True).values
-            minv = win.min(dim=4, keepdim=True).values
-            scalev = (maxv - minv) / 256
-            quant = (win - minv) / scalev
-            quant = torch.where(torch.isnan(quant), torch.zeros_like(quant), quant)
-            quant = torch.round(quant)
-            value = quant * scalev + minv
+            data_abs = torch.abs(win)
+            data_sign = torch.sign(win)
+            log_max = torch.log(maxv + 1)
+            log_data = torch.log(data_abs + 1)
+            norm_data = (log_data / log_max) * 255
+            norm_data = torch.where(torch.isnan(norm_data), torch.zeros_like(norm_data), norm_data)
+            quantized_data = torch.round(norm_data)
+            rlogdata = quantized_data / 255 * log_max
+            rdataabs = torch.exp(rlogdata) - 1
+            data = rdataabs * data_sign
+            value = data
             value = value.view(attention_weights.size(0), attention_weights.size(1), attention_weights.size(2), -1)
             if rvalue is None:
                 rvalue = value
             else:
                 rvalue = torch.cat([value, rvalue], dim=3)
         attention_weights = rvalue
-        # print(attention_weights.shape)
 
         # 计算加权求和
         output = torch.matmul(attention_weights, V)
