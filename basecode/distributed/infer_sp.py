@@ -194,8 +194,7 @@ class _CoreAttention(torch.nn.Module):
         context_layer = context_layer.permute(2, 0, 1, 3).contiguous()
 
         # [sq, b, np, hn] --> [sq, b, hp]
-        new_context_layer_shape = context_layer.size()[:-2] + (HIDDEN_SIZE,)
-        context_layer = context_layer.view(*new_context_layer_shape)
+        context_layer = einops.rearrange(context_layer, "s b h d -> s b (h d)")
 
         return context_layer
 
@@ -1123,6 +1122,6 @@ if __name__ == "__main__":
             text_generation = TextGeneration()
             # text_generation.run(["How big is the universe?"], 100)
             text = "how "
-            for _ in range(3900):
+            for _ in range(3960):
                 text += "how "
-            text_generation.run([text], 3)
+            text_generation.run([text], 20)
