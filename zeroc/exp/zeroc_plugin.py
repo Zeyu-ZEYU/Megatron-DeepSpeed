@@ -31,14 +31,14 @@ GPUS = [[1, 3]]
 MASTER_DIST_PORT = 43214
 MASTER_SERVER_PORT = 43211
 NODE_SERVER_PORT = 34119
-CODE_NAME_FOR_SHELL = "gpt_model_v04_mlsa_w_pipe.py"
-CODE_PATH_FOR_SHELL = "/u/qxc4fh/zeyu_workspace/Megatron-DeepSpeed/sps3"
+CODE_NAME_FOR_SHELL = "llama_based.py"
+CODE_PATH_FOR_SHELL = "/home/ubuntu/code/"
 
 
 # Inference config
 CONFIG = {}
-CONFIG["param_path"] = "/u/qxc4fh/zeyu_workspace/gpt_params.pkl"
-CONFIG["tokenizer_path"] = "/u/qxc4fh/zeyu_workspace/gpt_tokenizer_kernel.pkl"
+CONFIG["param_path"] = "params.pkl"
+CONFIG["tokenizer_path"] = "tokenizer_kernel.pkl"
 CONFIG["precision"] = 16
 
 

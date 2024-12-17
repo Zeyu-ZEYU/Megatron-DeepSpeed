@@ -845,14 +845,13 @@ class DistributedGPTModel(torch.nn.Module):
                 tokens2use_list = None
                 positions2use_list = None
                 split_indices = []
-                remaining_len = context_length
-                for i in range(self.num_wrk):
-                    if remaining_len >= CONTEXT_LEN:
-                        remaining_len -= CONTEXT_LEN
-                        split_indices.append((i + 1) * CONTEXT_LEN)
-                    else:
-                        split_indices.append(i * CONTEXT_LEN + remaining_len)
-                        break
+                num_indices = (
+                    (context_length // CONTEXT_LEN) - 1
+                    if context_length % CONTEXT_LEN == 0
+                    else (context_length // CONTEXT_LEN)
+                )
+                for i in range(num_indices):
+                    split_indices.append((i + 1) * CONTEXT_LEN)
                 tokens2use_list = [t.contiguous() for t in torch.tensor_split(tokens2use, split_indices, 1)]
                 positions2use_list = [t.contiguous() for t in torch.tensor_split(positions2use, split_indices, 1)]
                 if len(tokens2use_list) < self.num_wrk:
@@ -861,12 +860,21 @@ class DistributedGPTModel(torch.nn.Module):
                         positions2use_list.append(torch.empty([batch_size, 0], dtype=positions2use.dtype))
                 # Adjust attention mask.
                 attn_mask = attention_mask_repeat[..., 0:context_length, :context_length]
+                for i in range(len(positions2use_list)):
+                    tsr = positions2use_list[i]
+                    if i > 0 and tsr.size(1) > 0:
+                        positions2use_list[i] = torch.tensor(
+                            [[x for x in range(tsr.size(1))] for _ in range(batch_size)], dtype=torch.int64
+                        )
             else:
-                wrk_id = int(context_length / CONTEXT_LEN)
+                wrk_id = (
+                    context_length // CONTEXT_LEN - 1 if context_length % CONTEXT_LEN == 0 else context_length // CONTEXT_LEN
+                )
                 tokens2use_list = [torch.empty([batch_size, 0], dtype=tokens2use.dtype) for _ in range(self.num_wrk)]
                 positions2use_list = [torch.empty([batch_size, 0], dtype=positions2use.dtype) for _ in range(self.num_wrk)]
                 tokens2use_list[wrk_id] = tokens2use
-                positions2use_list[wrk_id] = positions2use
+                index_value = context_length - wrk_id * CONTEXT_LEN - 1
+                positions2use_list[wrk_id] = torch.tensor([[index_value] for _ in range(batch_size)], dtype=torch.int64)
                 # Adjust attention mask.
                 attn_mask = attention_mask_repeat[..., context_length - 1 : context_length, :context_length]
 
@@ -1093,7 +1101,10 @@ if __name__ == "__main__":
     config["param_path"] = "/u/qxc4fh/zeyu_workspace/gpt_params.pkl"
     config["tokenizer_path"] = "/u/qxc4fh/zeyu_workspace/gpt_tokenizer_kernel.pkl"
     config["precision"] = 16
-    config["devices"] = ["cuda:1", "cuda:3"]
+    config["devices"] = ["cuda:0", "cuda:1", "cuda:2", "cuda:3"]
     config["num_wrk"] = len(config["devices"])
 
-    DistributedGPTModel(config).run(["How big is the universe?"], 200)
+    test_str = "test " * (2048 * 3 + 2047)
+    test_str = test_str.strip()
+
+    DistributedGPTModel(config).run([test_str], 1)
