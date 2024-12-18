@@ -6,9 +6,9 @@ A zero-overhead KV dimensionality compression system for KV cache reduction in L
 
 ### Accuracy Metric Selection
 
-- For classification tasks and information retrieval tasks, we use the **accuracy** as the metric.
-- For summarization tasks, we use **ROUGE-1** as the accuracy score.
-- For code completion, we calculate the accuracy by **dividing the number of generated code that can be compiled by the total number of generated code**.
+- For classification tasks and information retrieval tasks, we use the ***accuracy*** as the metric.
+- For summarization tasks, we use ***ROUGE-1*** score as the accuracy score.
+- For code completion, we use ***Edit Similarity*** [1] as the accuracy.
 
 ### Dataset Dir
 IMDb movie genre classification: /zeroc/datasets/imdb
@@ -19,7 +19,7 @@ Cocktail for information retrieval: /zeroc/datasets/cocktail
 
 HumanEval for code completion: /zeroc/datasets/humaneval
 
-### ZeroC Dir
+## ZeroC Dir
 /zeroc  # ZeroC related code
 - datasets
 - exp
@@ -39,3 +39,6 @@ measurements: it has the measurement code for SVD and model analysis.
 quantization: it has the code of quantization methods.
 svd_qkv: SVD related code for QKV compression and analysis.
 ```
+
+## References
+[1] Zhang, Lei, et al. "Hierarchical Context Pruning: Optimizing Real-World Code Completion with Repository-Level Pretrained Code LLMs." arXiv preprint arXiv:2406.18294 (2024).
