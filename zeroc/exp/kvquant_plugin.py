@@ -346,17 +346,6 @@ def split_tensor_along_last_dim(
     num_partitions: int,
     contiguous_split_chunks: bool = False,
 ) -> List[torch.Tensor]:
-    """Split a tensor along its last dimension.
-
-    Arguments:
-        tensor: input tensor.
-        num_partitions: number of partitions to split the tensor
-        contiguous_split_chunks: If True, make each chunk contiguous
-                                 in memory.
-
-    Returns:
-        A list of Tensors
-    """
     # Get the size and dimension.
     last_dim = tensor.dim() - 1
     last_dim_size = divide(tensor.size()[last_dim], num_partitions)
@@ -577,13 +566,7 @@ class TransformerLayer(torch.nn.Module):
         self.bias_dropout_fusion = True
         self.drop_path = None
 
-        # self.post_attention_layernorm = LayerNorm(
-        #     HIDDEN_SIZE,
-        #     eps=1e-5,
-        #     no_persist_layer_norm=False,
-        #     sequence_parallel=False,
-        #     apply_layernorm_1p=False,
-        # )
+
         self.post_attention_layernorm = MixedFusedLayerNorm(HIDDEN_SIZE, 1e-5, sequence_parallel_enbaled=False)
 
         # MLP
@@ -691,34 +674,13 @@ class Transformer(torch.nn.Module):
             self.layers.append(build_layer(layer_num))
         self.layers = torch.nn.ModuleList(self.layers)
 
-        # self.final_layernorm = LayerNorm(
-        #     HIDDEN_SIZE,
-        #     eps=1e-5,
-        #     no_persist_layer_norm=False,
-        #     sequence_parallel=False,
-        #     apply_layernorm_1p=False,
-        # )
         self.final_layernorm = MixedFusedLayerNorm(HIDDEN_SIZE, 1e-5, sequence_parallel_enbaled=False)
 
     def _get_layer(self, layer_number):
         return self.layers[layer_number]
 
     def forward(self, hidden_states, attention_mask, set_inference_key_value_memory=False, inference_max_sequence_len=None):
-        # Viewless tensor.
-        # - We only need to create a viewless tensor in the case of micro batch
-        #   size (mbs) == 1, since in this case, 'hidden_states.transpose()'
-        #   above creates a view tensor, and '.contiguous()' is a pass-through.
-        #   For mbs >= 2, '.contiguous()' creates a new tensor, eliminating
-        #   the need to make it viewless.
-        #
-        #   However, we don't explicitly check mbs == 1 here because
-        #   make_viewless_tensor() has negligible overhead when its input
-        #   is already viewless.
-        #
-        # - For the 'else' case above, calling make_viewless_tensor() here is
-        #   likely redundant, since p2p_communication.py (likely originator)
-        #   already creates viewless tensors. That said, make_viewless_tensor()
-        #   is called here to be future-proof and corner-case-proof.
+
         hidden_states = core.utils.make_viewless_tensor(
             hidden_states,
             requires_grad=True,
@@ -783,19 +745,6 @@ class Transformer(torch.nn.Module):
                 layer_time += layer.layer_time
                 attn_time += layer.attn_time
                 lynorm_time += layer.lynorm_time
-
-        print(f"all2all time: {all2all_time}")
-        print(f"first all2all time: {all2all1_time}")
-        print(f"second all2all time: {all2all2_time}")
-        print(f"Malloc time: {malloc_time}")
-        print(f"MLP time: {mlp_time}")
-        print(f"QKV time: {qkv_time}")
-        print(f"Score time: {score_time}")
-        print(f"Softmax time: {softmax_time}")
-        print(f"V time: {v_time}")
-        print(f"Layer time: {layer_time}")
-        print(f"Attn time: {attn_time}")
-        print(f"Layer-norm time: {lynorm_time}")
 
         hidden_states = self.final_layernorm(hidden_states)
 
@@ -1255,14 +1204,13 @@ if __name__ == "__main__":
     config = {}
     config["master_ip"] = "127.0.0.1"
     config["master_port"] = 34565
-    config["param_path"] = "/u/qxc4fh/zeyu_workspace/gpt_params.pkl"
-    config["tokenizer_path"] = "./gpt_tokenizer_kernel.pkl"
+    config["param_path"] = "/u/qxc4fh/hugging_face_model.pkl"
+    config["tokenizer_path"] = "./tokenizer_kernel.pkl"
     config["precision"] = 16
     config["devices"] = ["cuda:0", "cuda:1"]
     config["num_wrk"] = len(config["devices"])
 
     test_str = "test " * (CONTEXT_LEN * (len(config["devices"]) - 1) + CONTEXT_LEN - 1)
-    # test_str = "test my be" * 1
     test_str = test_str.strip()
 
     DistributedGPTModel(config).run([test_str], 1)

@@ -121,11 +121,7 @@ class CoreAttention(torch.nn.Module):
         # [sk, b, np, hn] -> [sk, b * np, hn]
         key_layer = key_layer.view(output_size[3], output_size[0] * output_size[1], -1)
 
-        # preallocting input tensor: [b * np, sq, sk]
-        # TODO: improve the performance
-        # matmul_input_buffer = torch.empty(
-        #     output_size[0] * output_size[1], output_size[2], output_size[3], dtype=query_layer.dtype
-        # )
+
         matmul_input_buffer = torch.empty(1, device=query_layer.device)
 
         # Raw attention scores. [b * np, sq, sk]
@@ -184,37 +180,7 @@ class _SeqAllToAll(torch.autograd.Function):
     def forward(
         ctx: Any, input: torch.Tensor, scatter_idx: int, gather_idx: int, seq_len_list, is_first_seq_a2a=True
     ) -> torch.Tensor:
-        ctx.scatter_idx = scatter_idx
-        ctx.gather_idx = gather_idx
-
-        seq_world_size = dist.get_world_size()
-
-        if is_first_seq_a2a:
-            input_list = [t.contiguous() for t in torch.tensor_split(input, seq_world_size, scatter_idx)]
-            shape = torch.tensor(input_list[0].shape)
-            output_list = []
-            for sl in seq_len_list:
-                shape[gather_idx] = sl
-                output_list.append(torch.empty([x.item() for x in shape], dtype=input.dtype, device=input.device))
-        else:
-            split_indices = []
-            for sl in seq_len_list:
-                if len(split_indices) == 0:
-                    split_indices.append(sl)
-                else:
-                    split_indices.append(split_indices[-1] + sl)
-            input_list = [t.contiguous() for t in torch.tensor_split(input, split_indices, scatter_idx)]
-            shape = torch.tensor(input_list[0].shape)
-            shape[scatter_idx] = seq_len_list[dist.get_rank()]
-            output_list = [
-                torch.empty([x.item() for x in shape], dtype=input.dtype, device=input.device)
-                for _ in range(dist.get_world_size())
-            ]
-
-        # TODO Use all_to_all_single instead
-        dist.all_to_all(output_list, input_list)
-
-        return torch.cat(output_list, dim=gather_idx).contiguous()
+        pass
 
     @staticmethod
     def backward(ctx: Any, *grad_output: torch.Tensor) -> torch.Tuple[None, torch.Tensor, None, None]:
@@ -243,18 +209,6 @@ class DistributedAttention(torch.nn.Module):
         self.gather_idx = gather_idx
 
     def forward(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, *args: Any) -> torch.Tensor:
-        """forward
-
-        Arguments:
-            query (Tensor): query input to the layer
-            key (Tensor): key input to the layer
-            value (Tensor): value input to the layer
-            args: other args
-
-        Returns:
-            * output (Tensor): context output
-        """
-
         is_prompt = args[1]
         current_seq_len = args[2]
 
@@ -354,9 +308,6 @@ class Attention(torch.nn.Module):
         if inference_max_sequence_len is not None and inference_max_sequence_len == 0:
             assert hidden_states.size(0) == 0
 
-        # =================================================
-        # Pre-allocate memory for key-values for inference.
-        # =================================================
         if set_inference_key_value_memory:
             assert inference_max_sequence_len is not None and inference_max_sequence_len >= 0
             self.inference_key_memory = self._allocate_memory(
@@ -1090,8 +1041,8 @@ if __name__ == "__main__":
     config = {}
     config["master_ip"] = "127.0.0.1"
     config["master_port"] = 34565
-    config["param_path"] = "/u/qxc4fh/zeyu_workspace/gpt_params.pkl"
-    config["tokenizer_path"] = "/u/qxc4fh/zeyu_workspace/gpt_tokenizer_kernel.pkl"
+    config["param_path"] = "/u/qxc4fh/hugging_face_model.pkl"
+    config["tokenizer_path"] = "./tokenizer_kernel.pkl"
     config["precision"] = 16
     config["devices"] = ["cuda:1", "cuda:3"]
     config["num_wrk"] = len(config["devices"])

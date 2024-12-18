@@ -823,9 +823,6 @@ class GPTModel(torch.nn.Module):
         enc_attn_mask = enc_attn_mask.to(self.device)
         enc_position_ids = enc_position_ids.to(self.device)
 
-        torch.cuda.synchronize()
-        time0 = time.time()
-
         encoder_input = self.embedding(enc_input_ids, enc_position_ids)
         encoder_output = self.encoder(
             encoder_input, enc_attn_mask, set_inference_key_value_memory[0].item(), inference_max_sequence_len[0].item()
@@ -833,18 +830,9 @@ class GPTModel(torch.nn.Module):
         word_embeddings_weight = self.embedding.word_embeddings.weight
         logits = torch.matmul(encoder_output, word_embeddings_weight.t())
 
-        torch.cuda.synchronize()
-        time1 = time.time()
-        print(f"========== Inference time: {(time1-time0)*1000} ms")
-        exit()
-
         return logits.transpose(0, 1).contiguous()
 
     def _init_model(self, param_pickle_path):
-        # with open(param_pickle_path, "rb") as file:
-        #     params = pickle.load(file)
-        # for (key, _), (_, param) in zip(self.named_parameters(), params):
-        #     self.state_dict()[key].copy_(param)
         self.to(self.device)
 
 
@@ -1255,8 +1243,8 @@ if __name__ == "__main__":
     config = {}
     config["master_ip"] = "127.0.0.1"
     config["master_port"] = 34565
-    config["param_path"] = "/u/qxc4fh/zeyu_workspace/gpt_params.pkl"
-    config["tokenizer_path"] = "./gpt_tokenizer_kernel.pkl"
+    config["param_path"] = "/u/qxc4fh/hugging_face_model.pkl"
+    config["tokenizer_path"] = "./tokenizer_kernel.pkl"
     config["precision"] = 16
     config["devices"] = ["cuda:0", "cuda:1"]
     config["num_wrk"] = len(config["devices"])

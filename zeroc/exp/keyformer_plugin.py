@@ -109,9 +109,6 @@ class CoreAttention(torch.nn.Module):
         self.attention_dropout = torch.nn.Dropout(0.1)
 
     def forward(self, query_layer, key_layer, value_layer, attention_mask):
-        # ===================================
-        # Raw attention scores. [b, np, s, s]
-        # ===================================
 
         # [b, np, sq, sk]
         output_size = (query_layer.size(1), query_layer.size(2), query_layer.size(0), key_layer.size(0))
@@ -121,11 +118,7 @@ class CoreAttention(torch.nn.Module):
         # [sk, b, np, hn] -> [sk, b * np, hn]
         key_layer = key_layer.view(output_size[3], output_size[0] * output_size[1], -1)
 
-        # preallocting input tensor: [b * np, sq, sk]
-        # TODO: improve the performance
-        # matmul_input_buffer = torch.empty(
-        #     output_size[0] * output_size[1], output_size[2], output_size[3], dtype=query_layer.dtype
-        # )
+
         matmul_input_buffer = torch.empty(1, device=query_layer.device)
 
         # Raw attention scores. [b * np, sq, sk]
@@ -147,32 +140,20 @@ class CoreAttention(torch.nn.Module):
         # seem a bit unusual, but is taken from the original Transformer paper.
         attention_probs = self.attention_dropout(attention_probs)
 
-        # =========================
-        # Context layer. [sq, b, hp]
-        # =========================
 
-        # value_layer -> context layer.
-        # [sk, b, np, hn] --> [b, np, sq, hn]
 
-        # context layer shape: [b, np, sq, hn]
         output_size = (value_layer.size(1), value_layer.size(2), query_layer.size(0), value_layer.size(3))
 
-        # change view [sk, b * np, hn]
         value_layer = value_layer.view(value_layer.size(0), output_size[0] * output_size[1], -1)
 
-        # change view [b * np, sq, sk]
         attention_probs = attention_probs.view(output_size[0] * output_size[1], output_size[2], -1)
 
-        # matmul: [b * np, sq, hn]
         context_layer = torch.bmm(attention_probs, value_layer.transpose(0, 1))
 
-        # change view [b, np, sq, hn]
         context_layer = context_layer.view(*output_size)
 
-        # [b, np, sq, hn] --> [sq, b, np, hn]
         context_layer = context_layer.permute(2, 0, 1, 3).contiguous()
 
-        # [sq, b, np, hn] --> [sq, b, hp]
         new_context_layer_shape = context_layer.size()[:-2] + (context_layer.size(2) * context_layer.size(3),)
         context_layer = context_layer.view(*new_context_layer_shape)
 
@@ -321,12 +302,10 @@ def split_tensor_along_last_dim(
     Returns:
         A list of Tensors
     """
-    # Get the size and dimension.
     last_dim = tensor.dim() - 1
     last_dim_size = divide(tensor.size()[last_dim], num_partitions)
     # Split.
     tensor_list = torch.split(tensor, last_dim_size, dim=last_dim)
-    # Note: torch.split does not create contiguous tensors by default.
     if contiguous_split_chunks:
         return tuple(chunk.contiguous() for chunk in tensor_list)
 
@@ -354,9 +333,6 @@ class Attention(torch.nn.Module):
         if inference_max_sequence_len is not None and inference_max_sequence_len == 0:
             assert hidden_states.size(0) == 0
 
-        # =================================================
-        # Pre-allocate memory for key-values for inference.
-        # =================================================
         if set_inference_key_value_memory:
             assert inference_max_sequence_len is not None and inference_max_sequence_len >= 0
             self.inference_key_memory = self._allocate_memory(
@@ -367,25 +343,16 @@ class Attention(torch.nn.Module):
             )
             self.inference_current_sequence_len = 0
 
-        # Some consistency check.
         if inference_max_sequence_len is not None:
             assert self.inference_current_sequence_len <= self.inference_key_memory.size(0)
             assert inference_max_sequence_len == self.inference_key_memory.size(0)
-        # This is added for safety. In case inference_max_sequence_len
-        # is not provided, make sure there is no potential memory left
-        # from previous inference.
         if inference_max_sequence_len is None:
             self.inference_key_memory = None
             self.inference_value_memory = None
 
-        # =====================
-        # Query, Key, and Value
-        # =====================
 
-        # Attention heads [sq, b, h] --> [sq, b, (np * 3 * hn)]
         mixed_x_layer, _ = self.query_key_value(hidden_states)
 
-        # [sq, b, (np * 3 * hn)] --> [sq, b, np, 3 * hn]
         new_tensor_shape = mixed_x_layer.size()[:-1] + (
             NUM_HEADS,
             3 * HIDDEN_SIZE // NUM_HEADS,
@@ -395,11 +362,7 @@ class Attention(torch.nn.Module):
         # [sq, b, np, 3 * hn] --> 3 [sq, b, np, hn]
         (query_layer, key_layer, value_layer) = split_tensor_along_last_dim(mixed_x_layer, 3)
 
-        # ===================================================
-        # Adjust key, value, and attention mask for inference
-        # ===================================================
         if inference_max_sequence_len is not None:
-            # Adjust the range variables.
             start = self.inference_current_sequence_len
             self.inference_current_sequence_len += key_layer.size(0)
             end = self.inference_current_sequence_len
@@ -513,13 +476,6 @@ class TransformerLayer(torch.nn.Module):
         self.layer_num = layer_num
         self.precision = precision
         self.drop_path_rate = drop_path_rate
-        # self.input_layernorm = LayerNorm(
-        #     HIDDEN_SIZE,
-        #     eps=1e-5,
-        #     no_persist_layer_norm=False,
-        #     sequence_parallel=False,
-        #     apply_layernorm_1p=False,
-        # )
         self.input_layernorm = MixedFusedLayerNorm(HIDDEN_SIZE, 1e-5, sequence_parallel_enbaled=False)
         # Self attention.
         self.self_attention = Attention(layer_num, self.precision)
@@ -528,19 +484,11 @@ class TransformerLayer(torch.nn.Module):
         self.bias_dropout_fusion = True
         self.drop_path = None
 
-        # self.post_attention_layernorm = LayerNorm(
-        #     HIDDEN_SIZE,
-        #     eps=1e-5,
-        #     no_persist_layer_norm=False,
-        #     sequence_parallel=False,
-        #     apply_layernorm_1p=False,
-        # )
         self.post_attention_layernorm = MixedFusedLayerNorm(HIDDEN_SIZE, 1e-5, sequence_parallel_enbaled=False)
 
         # MLP
         self.mlp = MLP()
 
-        # Set bias+dropout+add fusion grad_enable execution handler.
         TORCH_MAJOR = int(torch.__version__.split(".")[0])
         TORCH_MINOR = int(torch.__version__.split(".")[1])
         use_nvfuser = TORCH_MAJOR > 1 or (TORCH_MAJOR == 1 and TORCH_MINOR >= 10)
@@ -562,7 +510,6 @@ class TransformerLayer(torch.nn.Module):
             layernorm_input = bias_dropout_add_func(attention_output, attention_bias, residual, self.hidden_dropout)
         layernorm_output = self.post_attention_layernorm(layernorm_input)
 
-        # MLP.
         mlp_bias = torch.tensor(0.0, device=layernorm_output.device, dtype=layernorm_output.dtype)
 
         mlp_output, mlp_bias = self.mlp(layernorm_output)
@@ -594,34 +541,12 @@ class Transformer(torch.nn.Module):
             self.layers.append(build_layer(layer_num))
         self.layers = torch.nn.ModuleList(self.layers)
 
-        # self.final_layernorm = LayerNorm(
-        #     HIDDEN_SIZE,
-        #     eps=1e-5,
-        #     no_persist_layer_norm=False,
-        #     sequence_parallel=False,
-        #     apply_layernorm_1p=False,
-        # )
         self.final_layernorm = MixedFusedLayerNorm(HIDDEN_SIZE, 1e-5, sequence_parallel_enbaled=False)
 
     def _get_layer(self, layer_number):
         return self.layers[layer_number]
 
     def forward(self, hidden_states, attention_mask, set_inference_key_value_memory=False, inference_max_sequence_len=None):
-        # Viewless tensor.
-        # - We only need to create a viewless tensor in the case of micro batch
-        #   size (mbs) == 1, since in this case, 'hidden_states.transpose()'
-        #   above creates a view tensor, and '.contiguous()' is a pass-through.
-        #   For mbs >= 2, '.contiguous()' creates a new tensor, eliminating
-        #   the need to make it viewless.
-        #
-        #   However, we don't explicitly check mbs == 1 here because
-        #   make_viewless_tensor() has negligible overhead when its input
-        #   is already viewless.
-        #
-        # - For the 'else' case above, calling make_viewless_tensor() here is
-        #   likely redundant, since p2p_communication.py (likely originator)
-        #   already creates viewless tensors. That said, make_viewless_tensor()
-        #   is called here to be future-proof and corner-case-proof.
         hidden_states = core.utils.make_viewless_tensor(
             hidden_states,
             requires_grad=True,
@@ -914,14 +839,11 @@ class DistributedGPTModel(torch.nn.Module):
 
             started = context_length_tensor <= context_length
 
-            # Clamp the predicted out of vocabulary tokens
             prev = torch.clamp(prev, max=tokenizer.vocab_size - 1)
             new_tokens = self._switch(tokens[:, context_length].view(-1), prev, started)
 
-            # Replace sampled tokens w/ done token if EOD has already been sampled
             new_tokens = self._switch(new_tokens, eod_id, is_done)
 
-            # Insert either new predicted or next prompt token
             tokens[:, context_length] = new_tokens
 
             if output_logits is None:
@@ -948,7 +870,6 @@ class DistributedGPTModel(torch.nn.Module):
             if done:
                 break
 
-        # tokens and output_logits can be used after the while loop.
         resp_sentences = []
         resp_sentences_seg = []
 
@@ -1044,23 +965,13 @@ class DistributedGPTModel(torch.nn.Module):
         return tokens, attention_mask, position_ids
 
     def _repetition_penalty(self, logits, repetition_penalty, used_tokens):
-        """Implement the repetition penalty, check paper
-        https://arxiv.org/pdf/1909.05858.pdf
-        """
         if used_tokens is not None and repetition_penalty != 1.0:
             logits_update = torch.gather(logits, 1, used_tokens)
             logits = torch.scatter(logits, 1, used_tokens, logits_update / repetition_penalty)
         return logits
 
     def _top_k_logits(self, logits, top_k=0, top_p=0.0, filter_value=-float("Inf")):
-        """This function has been mostly taken from huggingface conversational
-        ai code at
-            https://medium.com/huggingface/how-to-build-a-state-of-the-art-
-                conversational-ai-with-transfer-learning-2d818ac26313"""
-
         if top_k > 0:
-            # Remove all tokens with a probability less than the
-            # last token of the top-k
             indices_to_remove = logits < torch.topk(logits, top_k)[0][..., -1, None]
             logits[indices_to_remove] = filter_value
 

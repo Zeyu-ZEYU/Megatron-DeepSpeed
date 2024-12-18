@@ -31,14 +31,14 @@ GPUS = [[1, 3]]
 MASTER_DIST_PORT = 43214
 MASTER_SERVER_PORT = 43211
 NODE_SERVER_PORT = 34119
-CODE_NAME_FOR_SHELL = "llama_based.py"
+CODE_NAME_FOR_SHELL = "vllm_models.py"
 CODE_PATH_FOR_SHELL = "/home/ubuntu/code/"
 
 
 # Inference config
 CONFIG = {}
-CONFIG["param_path"] = "params.pkl"
-CONFIG["tokenizer_path"] = "tokenizer_kernel.pkl"
+# CONFIG["param_path"] = "params.pkl"
+# CONFIG["tokenizer_path"] = "tokenizer_kernel.pkl"
 CONFIG["precision"] = 16
 
 
