@@ -151,7 +151,7 @@ class_weights = class_weights / class_weights.sum()
 
 
 ### prepare collator
-model_name = "/home/zeyu/data/llama_3_genre_seqcls/checkpoint-30000"
+model_name = "/home/ubuntu/checkpoint-30000"
 
 
 MAX_LEN = 512
