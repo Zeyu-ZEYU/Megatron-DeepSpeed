@@ -7,8 +7,8 @@ A zero-overhead KV dimensionality compression system for KV cache reduction in L
 ### Accuracy Metric Selection
 
 - For classification tasks and information retrieval tasks, we use the ***accuracy*** as the metric.
-- For summarization tasks, we use ***ROUGE-1*** score as the accuracy score.
-- For code completion, we use ***Edit Similarity*** [1] as the accuracy.
+- For summarization tasks, we use ***ROUGE-1*** [1] score as the accuracy score.
+- For code completion, we use ***Edit Similarity (normalized Levenshtein distance)*** [2-3] as the accuracy.
 
 ### Dataset Dir
 IMDb movie genre classification: /zeroc/datasets/imdb
@@ -41,4 +41,8 @@ svd_qkv: SVD related code for QKV compression and analysis.
 ```
 
 ## References
-[1] Zhang, Lei, et al. "Hierarchical Context Pruning: Optimizing Real-World Code Completion with Repository-Level Pretrained Code LLMs." arXiv preprint arXiv:2406.18294 (2024).
+[1] ROUGE Score, https://en.wikipedia.org/wiki/ROUGE_(metric)
+
+[2] Zhang, Lei, et al. "Hierarchical Context Pruning: Optimizing Real-World Code Completion with Repository-Level Pretrained Code LLMs." arXiv preprint arXiv:2406.18294 (2024).
+
+[3] String Similarity Metrics - Edit Distance, https://www.baeldung.com/cs/string-similarity-edit-distance
