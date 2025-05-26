@@ -1,26 +1,28 @@
-## Repo of ZeroC
+## Repo of FastDC
 
-A zero-overhead KV dimensionality compression system for KV cache reduction in LLM inference.
+Fast KV Dimensionality Compression for Efficient LLM Serving
 
 ## Datasets
 
 ### Accuracy Metric Selection
 
 - For classification tasks and information retrieval tasks, we use the ***accuracy*** as the metric.
-- For summarization tasks, we use ***ROUGE-1*** [1] score as the accuracy score.
+- For summarization tasks and article generation tasks, we use ***ROUGE-1*** [1] score as the accuracy score.
 - For code completion, we use ***Edit Similarity (normalized Levenshtein distance)*** [2-3] as the accuracy.
 
 ### Dataset Dir
-IMDb movie genre classification: /zeroc/datasets/imdb
+IMDb movie genre classification: /fastdc/datasets/imdb
 
-arXiv summarization: /zeroc/datasets/arxiv
+arXiv summarization: /fastdc/datasets/arxiv
 
-Cocktail for information retrieval: /zeroc/datasets/cocktail
+Cocktail for information retrieval: /fastdc/datasets/cocktail
 
-HumanEval for code completion: /zeroc/datasets/humaneval
+HumanEval for code completion: /fastdc/datasets/humaneval
 
-## ZeroC Dir
-/zeroc  # ZeroC related code
+PG-19 for article generation: /fastdc/datasets/pg-19
+
+## FastDC Dir
+/fastdc  # FastDC related code
 - datasets
 - exp
 - kernels
@@ -32,8 +34,8 @@ HumanEval for code completion: /zeroc/datasets/humaneval
 
 ```
 datasets: it contains the datasets we use for validation.
-exp: it has the implementation code of zeroc.
-       # zeroc.py/keyformer(-z).py/kvquant(-z).py
+exp: it has the implementation code of FastDC.
+       # fastdc_plugin.py/keyformer(-f).py/kvquant(-f).py
 kernels: kernel functions.
 measurements: it has the measurement code for SVD and model analysis.
 quantization: it has the code of quantization methods.
